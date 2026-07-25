@@ -1866,6 +1866,10 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         from agent.copilot_acp_client import CopilotACPClient
 
         client = CopilotACPClient(**client_kwargs)
+        # Let the ACP client relay engine-internal activity (thinking
+        # narration, native tool calls) to this agent's progress rail; the
+        # per-turn callback is resolved lazily inside the client.
+        client._activity_agent = agent
         _ra().logger.info(
             "Copilot ACP client created (%s, shared=%s) %s",
             reason,

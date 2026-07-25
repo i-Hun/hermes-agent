@@ -588,6 +588,7 @@ class TelegramAdapter(BasePlatformAdapter):
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
     supports_code_blocks = True  # Telegram MarkdownV2 renders fenced code blocks
+    supports_expandable_quote = True  # MarkdownV2 "**> …||" collapsed blockquotes
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     # Bot API 10.1 Rich Messages cap the raw markdown/html text at 32,768
     # UTF-8 characters. Content above this is sent via the legacy chunking path.
@@ -7196,21 +7197,28 @@ class TelegramAdapter(BasePlatformAdapter):
         # 9) Convert blockquotes: > at line start → protect > from escaping
         #    Handle both regular blockquotes (> text) and expandable blockquotes
         #    (Telegram MarkdownV2: **> for expandable start, || to end the quote)
-        def _convert_blockquote(m):
-            prefix = m.group(1)  # >, >>, >>>, **>, or **>> etc.
-            content = m.group(2)
-            # Check if content ends with || (expandable blockquote end marker)
-            # In this case, preserve the trailing || unescaped for Telegram
-            if prefix.startswith('**') and content.endswith('||'):
-                return _ph(f'{prefix} {_escape_mdv2(content[:-2])}||')
-            return _ph(f'{prefix} {_escape_mdv2(content)}')
-
-        text = re.sub(
-            r'^((?:\*\*)?>{1,3}) (.+)$',
-            _convert_blockquote,
-            text,
-            flags=re.MULTILINE,
-        )
+        # Quote lines are converted with block context: the || expandable
+        # terminator is only meaningful inside a quote opened with **>, and
+        # it may sit on a plain-">" continuation line of that quote.  In a
+        # regular quote (opened with bare >) a trailing || is literal text
+        # and must be escaped.
+        _quote_line_re = re.compile(r'^((?:\*\*)?>{1,3}) (.+)$')
+        _bq_lines = text.split('\n')
+        _in_expandable = False
+        for _i, _bq_line in enumerate(_bq_lines):
+            _m = _quote_line_re.match(_bq_line)
+            if not _m:
+                _in_expandable = False
+                continue
+            _prefix, _content = _m.group(1), _m.group(2)
+            if _prefix.startswith('**'):
+                _in_expandable = True
+            if _in_expandable and _content.endswith('||'):
+                _bq_lines[_i] = _ph(f'{_prefix} {_escape_mdv2(_content[:-2])}||')
+                _in_expandable = False  # || closes the expandable quote
+            else:
+                _bq_lines[_i] = _ph(f'{_prefix} {_escape_mdv2(_content)}')
+        text = '\n'.join(_bq_lines)
 
         # 10) Escape remaining special characters in plain text
         text = _escape_mdv2(text)

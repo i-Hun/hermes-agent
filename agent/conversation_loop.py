@@ -777,7 +777,12 @@ def run_conversation(
         # Counter resets whenever skill_manage is actually used.
         if (agent._skill_nudge_interval > 0
                 and "skill_manage" in agent.valid_tool_names):
-            agent._iters_since_skill += 1
+            # On the native ACP path one iteration can hide dozens of engine
+            # tool calls, so a flat +1 never reaches the threshold — see
+            # agent/acp_nudge.py.
+            from agent.acp_nudge import skill_iterations_delta
+
+            agent._iters_since_skill += skill_iterations_delta(agent)
         
         # ── Pre-API-call /steer drain ──────────────────────────────────
         # If a /steer arrived during the previous API call (while the model

@@ -893,9 +893,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
             break
 
-        # Stale-call detector: kill the connection if no response
-        # arrives within the configured timeout.
-        if _elapsed > _stale_timeout:
+        # Stale-call detector: kill the connection if no response arrives
+        # within the configured timeout. Providers that report engine activity
+        # (ACP) are judged on IDLE time instead of total time — see
+        # agent/acp_stale.py.
+        from agent.acp_stale import should_kill_stale
+
+        if should_kill_stale(agent, _elapsed, _stale_timeout):
             _est_ctx = estimate_request_context_tokens(api_kwargs)
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)

@@ -19337,7 +19337,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # "💻 terminal" header so back-to-back commands render as
                 # adjacent code blocks under a single header.
                 _block_header = (
-                    "" if last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
+                    ""
+                    if last_was_terminal_block[0] and progress_grouping != "replace"
+                    else f"{emoji} {tool_name}\n"
                 )
                 _code_block_full = f"{_block_header}```\n{_cmd_full}\n```"
                 # Single-line, capped preview for non-verbose modes.
@@ -19532,6 +19534,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
 
+            # ── Collapsible history + live subagent transcripts (#67479) ──
+            # Local overlay: all logic lives in gateway/progress_collapse.py
+            # so upstream churn in this file cannot conflict with it.
+            from gateway.progress_collapse import ProgressCollapser
+            _prog = ProgressCollapser(progress_grouping, adapter)
+
             _progress_len_fn = (
                 adapter.message_len_fn
                 if isinstance(adapter, BasePlatformAdapter)
@@ -19695,10 +19703,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         progress_lines = []
                         last_progress_msg[0] = None
                         repeat_count[0] = 0
+                        _prog.on_content_bubble()
                         continue
                     else:
                         msg = raw
-                        progress_lines.append(msg)
+                        progress_lines = _prog.append(progress_lines, msg)
 
                     if await _roll_progress_overflow_if_needed():
                         _last_edit_ts = time.monotonic()
@@ -19725,7 +19734,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                     if can_edit and progress_msg_id is not None:
                         # Try to edit the existing progress message
-                        full_text = "\n".join(progress_lines)
+                        full_text = _prog.render(progress_lines)
                         result = await _edit_progress_message(progress_msg_id, full_text)
                         if not result.success:
                             _err = (getattr(result, "error", "") or "").lower()
@@ -19765,7 +19774,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
-                            full_text = "\n".join(progress_lines)
+                            full_text = _prog.render(progress_lines)
                             result = await adapter.send(
                                 chat_id=source.chat_id,
                                 content=full_text,
@@ -19793,6 +19802,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
 
                 except queue.Empty:
+                    # Live subagent tail (#67479) — logic in
+                    # gateway/progress_collapse.py (local overlay).
+                    _st = await _prog.refresh_tail_io(
+                        progress_lines,
+                        active=can_edit and _run_still_current(),
+                        throttle_ok=(
+                            time.monotonic() - _last_edit_ts
+                        ) >= _PROGRESS_EDIT_INTERVAL,
+                        message_id=progress_msg_id,
+                        edit_fn=_edit_progress_message,
+                        send_fn=_send_progress_text,
+                        logger=logger,
+                    )
+                    if _st is not None:
+                        progress_msg_id, _can_still_edit = _st
+                        if not _can_still_edit:
+                            can_edit = False
+                        _last_edit_ts = time.monotonic()
                     await asyncio.sleep(0.3)
                 except asyncio.CancelledError:
                     # Drain remaining queued messages

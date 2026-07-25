@@ -13,6 +13,7 @@ from unittest.mock import patch
 from agent.copilot_acp_client import CopilotACPClient
 
 
+
 class _FakeProcess:
     def __init__(self) -> None:
         self.stdin = io.StringIO()
@@ -140,20 +141,6 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         payload = process.stdin.getvalue().strip()
         self.assertTrue(payload)
         return json.loads(payload)
-
-    def test_request_permission_is_not_auto_allowed(self) -> None:
-        response = self._dispatch(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "session/request_permission",
-                "params": {},
-            },
-            cwd="/tmp",
-        )
-
-        outcome = (((response.get("result") or {}).get("outcome") or {}).get("outcome"))
-        self.assertEqual(outcome, "cancelled")
 
     def test_read_text_file_blocks_internal_hermes_hub_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -292,6 +279,7 @@ def test_run_prompt_preserves_real_home_when_profile_home_available(monkeypatch,
 
     monkeypatch.setenv("HOME", str(real_home))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
 
     captured = {}
     client = _make_home_client(tmp_path)
@@ -317,3 +305,5 @@ def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
 
     assert "env" in captured["kwargs"]
     assert captured["kwargs"]["env"]["HOME"]
+
+

@@ -33,6 +33,52 @@ from tools.environments.local import hermes_subprocess_env
 ACP_MARKER_BASE_URL = "acp://copilot"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 
+
+# One-live-bridge-per-session invariant — a belt over agent/turn_lease.py. Two
+# concurrent turns on the SAME hermes session must never both hold a live ACP
+# bridge: interleaved writes corrupt the single engine transcript (the
+# "Repaired N message-alternation violation(s)" symptom). Keyed by the hermes
+# session id (agent.session_id); the newest spawn wins and terminates any stale
+# bridge left behind by a /stop or a fail-open turn overlap.
+_LIVE_BRIDGES: dict[str, "subprocess.Popen[str]"] = {}
+_LIVE_BRIDGES_LOCK = threading.Lock()
+
+
+def _claim_session_bridge(session_id, proc) -> None:
+    """Make ``proc`` the sole live bridge for ``session_id``.
+
+    If a concurrent turn on the same hermes session still owns a live bridge
+    (turn_lease failed open on a long turn, or a /stop left the old ACP process
+    running), terminate it first — two turns interleaving writes into one engine
+    transcript is what produces the "Repaired N message-alternation violation(s)"
+    corruption. Newest spawn wins. Within a single turn's own failover this is a
+    no-op: the primary bridge is closed + released before the retry spawns.
+    """
+    if not session_id:
+        return
+    with _LIVE_BRIDGES_LOCK:
+        prev = _LIVE_BRIDGES.get(session_id)
+        if prev is not None and prev is not proc and prev.poll() is None:
+            try:
+                prev.terminate()
+                prev.wait(timeout=2)
+            except Exception:
+                try:
+                    prev.kill()
+                except Exception:
+                    pass
+        _LIVE_BRIDGES[session_id] = proc
+
+
+def _release_session_bridge(session_id, proc) -> None:
+    """Drop ``proc`` from the registry, but only if it still owns the slot
+    (a newer turn may have already replaced it)."""
+    if not session_id:
+        return
+    with _LIVE_BRIDGES_LOCK:
+        if _LIVE_BRIDGES.get(session_id) is proc:
+            _LIVE_BRIDGES.pop(session_id, None)
+
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
 
@@ -111,6 +157,72 @@ def _build_subprocess_env() -> dict[str, str]:
     return env
 
 
+def _acp_env_with_model(model_override):
+    """Subprocess env for the ACP wrapper, optionally forcing a model.
+
+    The wrapper (claude-acp-run.sh) selects the engine model from
+    ``$HERMES_ACP_MODEL`` (default claude-opus-4-8). Injecting it here lets a
+    per-call retry re-spawn the bridge on a different model without touching
+    any file -- this is what powers per-call auto-failover.
+    """
+    env = _build_subprocess_env()
+    if model_override:
+        env["HERMES_ACP_MODEL"] = str(model_override)
+    return env
+
+
+def _acp_failover_enabled():
+    return os.getenv("HERMES_ACP_FAILOVER", "1").strip().lower() not in (
+        "0", "false", "no", "off", "",
+    )
+
+
+def _acp_failover_model():
+    return os.getenv("HERMES_ACP_FALLBACK_MODEL", "").strip() or "claude-opus-4-8"
+
+
+def _acp_effective_model():
+    """The model the wrapper uses by default (env override or its opus default).
+
+    Must agree with claude-acp-run.sh's ``${HERMES_ACP_MODEL:-claude-opus-4-8}``
+    so failover comparison and the usage ledger label the real engine model.
+    Fable's limits are exhausted, so opus is primary fleet-wide; when Fable
+    returns, set ``HERMES_ACP_MODEL=claude-fable-5`` in the gateway env to flip
+    back (that also re-arms opus failover, since primary != failover again).
+    """
+    return os.getenv("HERMES_ACP_MODEL", "").strip() or "claude-opus-4-8"
+
+
+# --- Native MCP tool-calling (fable refusal fix) ------------------------------
+# The legacy path injects a "<tool_call>{...} in OpenAI shape" instruction into
+# the prompt and regex-parses tool calls back out of the model's TEXT. Claude
+# Fable 5's frontier safeguard classifies that instruction as
+# `reasoning_extraction` and REFUSES, so the engine silently falls back to opus.
+#
+# Native mode instead hands Hermes' tools to the real claude engine as a proper
+# ACP MCP server (session/new.mcpServers) and lets the engine orchestrate with
+# first-class tool-use — exactly how openclaw's claude-cli runtime works. No
+# shim instruction, no refusal, and billing stays first-party (the bridge is
+# already on the subscription OAuth token). Proven by scripts/acp_native_tools_probe.py.
+#
+# Gated OFF by default so the whole copilot-acp fleet is unaffected until a
+# single agent is validated end-to-end. Enable per-agent with
+# HERMES_ACP_NATIVE_TOOLS=1. Rides documented ACP + MCP interfaces (not binary
+# internals), so it survives claude-agent-acp / claude CLI updates.
+
+# --- Native-tools bridge (local overlay) ------------------------------------
+# MCP wiring + engine-activity rendering live in agent/acp_native_tools.py;
+# re-exported here so upstream call sites and tests keep their import path.
+from agent.acp_native_tools import (  # noqa: E402,F401
+    _acp_native_tools_enabled,
+    _acp_tool_activity_label,
+    _acp_tool_started_fields,
+    _hermes_agent_root,
+    _hermes_tools_mcp_servers,
+    _normalize_native_tool_name,
+)
+
+
 def _jsonrpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
@@ -122,16 +234,31 @@ def _jsonrpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
     }
 
 
-def _permission_denied(message_id: Any) -> dict[str, Any]:
-    return {
-        "jsonrpc": "2.0",
-        "id": message_id,
-        "result": {
-            "outcome": {
-                "outcome": "cancelled",
-            }
-        },
-    }
+# --- Permission guard (local overlay) ---------------------------------------
+# The approve/deny decision layer lives in agent/acp_permission_guard.py so
+# this upstream file carries an import instead of ~600 local lines — every
+# line kept here is conflict surface for the next `hermes update`. Names are
+# re-exported because tests and other modules import them from here.
+from agent.acp_permission_guard import (  # noqa: E402,F401
+    _ACP_AUDIT_LOG_NAME,
+    _CREDENTIAL_BASENAMES,
+    _DENY_HINT,
+    _DISCARD_SINKS,
+    _acp_audit,
+    _credential_basename_match,
+    _curator_file_reason,
+    _curator_permission_reason,
+    _has_recursive_force_rm,
+    _is_discard_sink,
+    _permission_allow,
+    _permission_command_text,
+    _permission_danger_reason,
+    _permission_denied,
+    _shell_credential_exfil,
+    _shell_danger_reason,
+    _shell_tokens,
+    _strip_content_fields,
+)
 
 
 def _format_messages_as_prompt(
@@ -139,17 +266,30 @@ def _format_messages_as_prompt(
     model: str | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
+    native_tools: bool = False,
 ) -> str:
-    sections: list[str] = [
-        "You are being used as the active ACP agent backend for Hermes.",
-        "Use ACP capabilities to complete tasks.",
-        "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
-        "If no tool is needed, answer normally.",
-    ]
+    if native_tools:
+        # Tools reach the engine as a native MCP server (session/new.mcpServers),
+        # so we must NOT inject the <tool_call> shim — that instruction is what
+        # trips Fable's reasoning_extraction refusal. Give a clean, neutral
+        # preamble and let the engine drive tools itself.
+        sections = [
+            "You are being used as the active ACP agent backend for Hermes.",
+            "You have access to native tools (including the `hermes-tools` MCP "
+            "server). Use them directly to complete tasks; answer normally when "
+            "no tool is needed.",
+        ]
+    else:
+        sections = [
+            "You are being used as the active ACP agent backend for Hermes.",
+            "Use ACP capabilities to complete tasks.",
+            "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
+            "If no tool is needed, answer normally.",
+        ]
     if model:
         sections.append(f"Hermes requested model hint: {model}")
 
-    if isinstance(tools, list) and tools:
+    if not native_tools and isinstance(tools, list) and tools:
         tool_specs: list[dict[str, Any]] = []
         for t in tools:
             if not isinstance(t, dict):
@@ -175,7 +315,7 @@ def _format_messages_as_prompt(
                 + json.dumps(tool_specs, ensure_ascii=False)
             )
 
-    if tool_choice is not None:
+    if not native_tools and tool_choice is not None:
         sections.append(f"Tool choice hint: {json.dumps(tool_choice, ensure_ascii=False)}")
 
     transcript: list[str] = []
@@ -415,10 +555,18 @@ class CopilotACPClient:
         self._acp_command = acp_command or command or _resolve_command()
         self._acp_args = list(acp_args or args or _resolve_args())
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
+        self._native_tools = _acp_native_tools_enabled()
+        self._mcp_servers = _hermes_tools_mcp_servers() if self._native_tools else []
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
+        # Native-tools observability: every tool_call session/update the engine
+        # reports is recorded here ({name, arguments}). On the native MCP path
+        # tool calls never surface in the OpenAI-shaped response, so this list
+        # is the only ground truth for reports (e.g. the curator's run.json).
+        self._native_tool_calls: list[dict[str, str]] = []
+        self._native_call_index: dict[str, int] = {}
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
@@ -428,6 +576,11 @@ class CopilotACPClient:
         self.is_closed = True
         if proc is None:
             return
+        # Drop this bridge from the per-session registry.
+        _release_session_bridge(
+            getattr(getattr(self, "_activity_agent", None), "session_id", None),
+            proc,
+        )
         try:
             proc.terminate()
             proc.wait(timeout=2)
@@ -453,6 +606,7 @@ class CopilotACPClient:
             model=model,
             tools=tools,
             tool_choice=tool_choice,
+            native_tools=self._native_tools,
         )
         # Normalise timeout: run_agent.py may pass an httpx.Timeout object
         # (used natively by the OpenAI SDK) rather than a plain float.
@@ -470,12 +624,84 @@ class CopilotACPClient:
             _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
             _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
 
-        response_text, reasoning_text = self._run_prompt(
-            prompt_text,
-            timeout_seconds=_effective_timeout,
-        )
+        from agent.acp_usage_ledger import record_usage
 
-        tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
+        _session_id = getattr(
+            getattr(self, "_activity_agent", None), "session_id", None
+        )
+        _requested_model = model
+        _used_model = _acp_effective_model()
+        _failover_fired = False
+        # Request 3: when a fast-fail model is primary (Fable) with opus failover
+        # armed, cap the PRIMARY attempt so a wedged primary yields to opus fast
+        # instead of holding the session for the full timeout — this is what
+        # narrows the turn_lease fail-open window. Opus-primary (no distinct
+        # failover) keeps the full timeout; the failover retry always does too.
+        from agent.acp_failover import primary_attempt_timeout
+
+        _primary_timeout = primary_attempt_timeout(
+            _effective_timeout,
+            primary_model=_used_model,
+            failover_model=_acp_failover_model(),
+            failover_enabled=_acp_failover_enabled(),
+        )
+        try:
+            response_text, reasoning_text = self._run_prompt(
+                prompt_text,
+                timeout_seconds=_primary_timeout,
+            )
+        except (RuntimeError, TimeoutError) as _primary_exc:
+            _fo_model = _acp_failover_model()
+            if (
+                _acp_failover_enabled()
+                and _fo_model
+                and _fo_model != _used_model
+            ):
+                try:
+                    self._fire_engine_activity(
+                        "_thinking",
+                        "primary model failed (%s); failing over to %s"
+                        % (type(_primary_exc).__name__, _fo_model),
+                    )
+                except Exception:
+                    pass
+                try:
+                    response_text, reasoning_text = self._run_prompt(
+                        prompt_text,
+                        timeout_seconds=_effective_timeout,
+                        model_override=_fo_model,
+                    )
+                    _used_model = _fo_model
+                    _failover_fired = True
+                except (RuntimeError, TimeoutError):
+                    record_usage(
+                        session_id=_session_id,
+                        requested_model=_requested_model,
+                        used_model=_fo_model,
+                        prompt_text=prompt_text,
+                        completion_text=None,
+                        failover=True,
+                        ok=False,
+                    )
+                    raise
+            else:
+                record_usage(
+                    session_id=_session_id,
+                    requested_model=_requested_model,
+                    used_model=_used_model,
+                    prompt_text=prompt_text,
+                    completion_text=None,
+                    failover=False,
+                    ok=False,
+                )
+                raise
+
+        if self._native_tools:
+            # Engine orchestrated tools natively over MCP — nothing to parse out
+            # of the text; the response IS the final answer.
+            tool_calls, cleaned_text = [], (response_text or "").strip()
+        else:
+            tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
 
         usage = SimpleNamespace(
             prompt_tokens=0,
@@ -495,13 +721,27 @@ class CopilotACPClient:
         completion = SimpleNamespace(
             choices=[choice],
             usage=usage,
-            model=model or "copilot-acp",
+            model=_used_model or model or "copilot-acp",
+        )
+        record_usage(
+            session_id=_session_id,
+            requested_model=_requested_model,
+            used_model=_used_model,
+            prompt_text=prompt_text,
+            completion_text=cleaned_text,
+            reasoning_text=reasoning_text,
+            failover=_failover_fired,
+            ok=True,
         )
         if stream:
             return _completion_to_stream_chunks(completion)
         return completion
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float, model_override: str | None = None) -> tuple[str, str]:
+        # Fresh tool-pulse dedup state per prompt — engine toolCallIds are
+        # only unique within a session, and stale ids would leak memory.
+        self._acp_fired_tool_ids = set()
+        self._acp_pending_tools = {}
         try:
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args,
@@ -511,7 +751,7 @@ class CopilotACPClient:
                 text=True,
                 bufsize=1,
                 cwd=self._acp_cwd,
-                env=_build_subprocess_env(),
+                env=_acp_env_with_model(model_override),
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
@@ -526,6 +766,12 @@ class CopilotACPClient:
         self.is_closed = False
         with self._active_process_lock:
             self._active_process = proc
+
+        # One-live-bridge-per-session invariant (belt over turn_lease).
+        _claim_session_bridge(
+            getattr(getattr(self, "_activity_agent", None), "session_id", None),
+            proc,
+        )
 
         inbox: queue.Queue[dict[str, Any]] = queue.Queue()
         stderr_tail: deque[str] = deque(maxlen=40)
@@ -634,7 +880,7 @@ class CopilotACPClient:
                 "session/new",
                 {
                     "cwd": self._acp_cwd,
-                    "mcpServers": [],
+                    "mcpServers": self._mcp_servers,
                 },
             ) or {}
             session_id = str(session.get("sessionId") or "").strip()
@@ -661,6 +907,111 @@ class CopilotACPClient:
         finally:
             self.close()
 
+    def _fire_engine_activity(
+        self,
+        event_type: str,
+        tool_name: str | None = None,
+        preview: str | None = None,
+        args: dict[str, Any] | None = None,
+    ) -> None:
+        """Relay engine-internal activity to the owning agent's progress rail.
+
+        ``_activity_agent`` is attached at client construction (see
+        ``create_openai_client``). The gateway re-binds
+        ``agent.tool_progress_callback`` per turn, so we resolve it at call
+        time; without an attached agent (aux clients, tests) this is a no-op.
+        Runs on the ACP stdout-reader thread — the gateway callback is
+        thread-safe (queue-backed) by design.
+        """
+        agent = getattr(self, "_activity_agent", None)
+        if agent is not None:
+            # Liveness stamp for the stale-call detector: a non-streaming ACP
+            # call produces no bytes while the engine works, so without this
+            # a long-but-healthy turn is killed at the stale threshold and
+            # answered by the failover model (see agent/acp_stale.py).
+            try:
+                agent._acp_last_event_ts = time.time()
+            except Exception:
+                pass
+        cb = getattr(agent, "tool_progress_callback", None) if agent is not None else None
+        if cb is None:
+            return
+        try:
+            cb(event_type, tool_name, preview, args)
+        except Exception:
+            pass
+
+    def _curator_session(self) -> bool:
+        """True when this client serves the background skill-curator fork."""
+        agent = getattr(self, "_activity_agent", None)
+        platform = getattr(agent, "platform", "") if agent is not None else ""
+        return str(platform or "").strip().lower() == "curator"
+
+    _NATIVE_CALL_CAP = 800
+    _NATIVE_CALL_ARGS_CAP = 2000
+
+    def _record_native_tool_call(self, update: dict[str, Any], kind: str) -> None:
+        """Track engine tool calls ({name, arguments}) for post-run reports.
+
+        The initial tool_call often arrives without rawInput (arguments land
+        via tool_call_update), so entries are indexed by toolCallId and
+        backfilled. Never raises.
+        """
+        try:
+            calls = self._native_tool_calls
+            index = self._native_call_index
+        except AttributeError:
+            calls = self._native_tool_calls = []
+            index = self._native_call_index = {}
+        # Mirror onto the owning agent. Per-REQUEST clients are created with
+        # shared=False and discarded when the call returns (run_agent
+        # _create_request_openai_client), so a ledger kept only on the client
+        # dies with it — curator then reads agent.client._native_tool_calls and
+        # sees [] even though the engine ran tools (verified 2026-07-25: a
+        # background skill review wrote a skill via the MCP bridge while the
+        # ledger read 0). The agent outlives every request, so it owns the
+        # authoritative list; the client-local one stays for compatibility.
+        agent = getattr(self, "_activity_agent", None)
+        if agent is not None:
+            try:
+                shared = getattr(agent, "_acp_native_tool_calls", None)
+                if shared is None:
+                    shared = agent._acp_native_tool_calls = []
+                if shared is not calls:
+                    calls = self._native_tool_calls = shared
+            except Exception:
+                pass
+        try:
+            tool_id = str(
+                update.get("toolCallId") or update.get("tool_call_id") or ""
+            ) or None
+            name, _preview, args = _acp_tool_started_fields(update)
+            norm = _normalize_native_tool_name(name)
+            args_json = ""
+            if isinstance(args, dict):
+                try:
+                    args_json = json.dumps(args, ensure_ascii=False)
+                except Exception:
+                    args_json = str(args)
+                if len(args_json) > self._NATIVE_CALL_ARGS_CAP:
+                    args_json = args_json[: self._NATIVE_CALL_ARGS_CAP] + "…"
+            if tool_id is not None and tool_id in index:
+                # Known call: backfill arguments/name from the update.
+                entry = calls[index[tool_id]]
+                if args_json and not entry.get("arguments"):
+                    entry["arguments"] = args_json
+                if entry.get("name") in ("", "tool") and norm not in ("", "tool"):
+                    entry["name"] = norm
+                return
+            if kind == "tool_call" or tool_id is not None:
+                if len(calls) >= self._NATIVE_CALL_CAP:
+                    return
+                calls.append({"name": norm, "arguments": args_json})
+                if tool_id is not None:
+                    index[tool_id] = len(calls) - 1
+        except Exception:
+            pass
+
     def _handle_server_message(
         self,
         msg: dict[str, Any],
@@ -686,6 +1037,68 @@ class CopilotACPClient:
                 text_parts.append(chunk_text)
             elif kind == "agent_thought_chunk" and chunk_text and reasoning_parts is not None:
                 reasoning_parts.append(chunk_text)
+            elif kind in ("tool_call", "tool_call_update"):
+                self._record_native_tool_call(update, kind)
+                # Message text emitted BEFORE a tool call is the engine's
+                # progress narration, not the final answer. Reclassify it as
+                # reasoning so show_reasoning=false hides it; only the text
+                # after the last tool call remains the user-facing reply.
+                if text_parts:
+                    flushed = "".join(text_parts).strip()
+                    text_parts.clear()
+                    if flushed:
+                        if reasoning_parts is not None:
+                            reasoning_parts.append(flushed + "\n\n")
+                        # Live "thinking" pulse for the gateway progress
+                        # bubble (💬 …, gated on display.thinking_progress).
+                        first_line = flushed.splitlines()[0][:200]
+                        self._fire_engine_activity("_thinking", first_line)
+                if kind == "tool_call" and reasoning_parts is not None:
+                    label = _acp_tool_activity_label(update)
+                    if label:
+                        reasoning_parts.append(f"\n⚙️ {label}\n")
+                # Live tool pulse (⚙️ tool: …, gated on tool_progress).
+                # The engine's initial tool_call often arrives WITHOUT
+                # rawInput (the command/path lands later via
+                # tool_call_update), so an eager pulse renders as a
+                # preview-less "⚙️ Terminal..." line. Defer the pulse until
+                # arguments are available and fire it exactly once per
+                # toolCallId; id-less updates keep the eager behavior.
+                fired = getattr(self, "_acp_fired_tool_ids", None)
+                if fired is None:
+                    fired = self._acp_fired_tool_ids = set()
+                pending = getattr(self, "_acp_pending_tools", None)
+                if pending is None:
+                    pending = self._acp_pending_tools = {}
+                tool_id = str(
+                    update.get("toolCallId") or update.get("tool_call_id") or ""
+                ) or None
+                _tname, _tprev, _targs = _acp_tool_started_fields(update)
+                _has_details = bool(_tprev or _targs)
+                if kind == "tool_call":
+                    if tool_id is None:
+                        self._fire_engine_activity("tool.started", _tname, _tprev, _targs)
+                    elif _has_details:
+                        fired.add(tool_id)
+                        self._fire_engine_activity("tool.started", _tname, _tprev, _targs)
+                    else:
+                        pending[tool_id] = _tname
+                elif (
+                    tool_id is not None
+                    and tool_id in pending
+                    and tool_id not in fired
+                    and _has_details
+                ):
+                    orig_name = pending.pop(tool_id)
+                    fired.add(tool_id)
+                    if _tname == "tool" and orig_name:
+                        # The update usually carries no title — re-map with
+                        # the remembered one so shell tools still hit the
+                        # "terminal" fenced-block rendering.
+                        _tname, _tprev, _targs = _acp_tool_started_fields(
+                            {**update, "title": orig_name}
+                        )
+                    self._fire_engine_activity("tool.started", _tname, _tprev, _targs)
             return True
 
         if process.stdin is None:
@@ -695,7 +1108,13 @@ class CopilotACPClient:
         params = msg.get("params") or {}
 
         if method == "session/request_permission":
-            response = _permission_denied(message_id)
+            response = _permission_allow(
+                message_id,
+                params,
+                extra_reason_fn=(
+                    _curator_permission_reason if self._curator_session() else None
+                ),
+            )
         elif method == "fs/read_text_file":
             try:
                 path = _ensure_path_within_cwd(str(params.get("path") or ""), cwd)
@@ -730,6 +1149,10 @@ class CopilotACPClient:
                 denied = get_write_denied_error(str(path))
                 if denied:
                     raise PermissionError(denied)
+                if self._curator_session():
+                    curator_denied = _curator_file_reason([str(path)])
+                    if curator_denied:
+                        raise PermissionError(curator_denied)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(str(params.get("content") or ""))
                 response = {

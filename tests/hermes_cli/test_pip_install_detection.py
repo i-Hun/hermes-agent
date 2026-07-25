@@ -182,8 +182,12 @@ def test_banner_warns_on_pip_install(tmp_path):
     hh.mkdir()
     (hh / ".install_method").write_text("pip\n")
 
+    # Point the code-scoped stamp lookup away from the real checkout: a git
+    # working copy carries its own authoritative .install_method, which would
+    # otherwise win over the home-scoped stamp this test stages.
     with patch("hermes_cli.config.get_hermes_home", return_value=hh), \
-         patch("hermes_constants.get_hermes_home", return_value=hh):
+         patch("hermes_constants.get_hermes_home", return_value=hh), \
+         patch("hermes_cli.config.get_project_root", return_value=tmp_path / "proj"):
         buf = io.StringIO()
         # Wide console so the warning isn't wrapped across lines in the panel.
         console = Console(file=buf, width=400, force_terminal=False, color_system=None)
@@ -208,8 +212,11 @@ def test_banner_warns_on_homebrew_install(tmp_path):
     hh.mkdir()
     (hh / ".install_method").write_text("homebrew\n")
 
+    # See test_banner_warns_on_pip_install: isolate from the checkout's own
+    # code-scoped .install_method stamp.
     with patch("hermes_cli.config.get_hermes_home", return_value=hh), \
-         patch("hermes_constants.get_hermes_home", return_value=hh):
+         patch("hermes_constants.get_hermes_home", return_value=hh), \
+         patch("hermes_cli.config.get_project_root", return_value=tmp_path / "proj"):
         buf = io.StringIO()
         console = Console(file=buf, width=400, force_terminal=False, color_system=None)
         banner.build_welcome_banner(

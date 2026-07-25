@@ -909,6 +909,21 @@ def _run_review_in_thread(
             )
             actions = []
 
+        if not actions:
+            # Native ACP path: the engine's tool calls never appear as `tool`
+            # messages, so the walk above finds nothing even when the review
+            # did real work. Rebuild from the engine ledger — see
+            # agent/acp_native_calls.native_review_actions.
+            try:
+                from agent.acp_native_calls import native_review_actions
+
+                actions = native_review_actions(
+                    review_agent,
+                    getattr(agent, "memory_notifications", "on"),
+                )
+            except Exception:
+                actions = []
+
         if actions:
             summary = " · ".join(dict.fromkeys(actions))
             agent._safe_print(
