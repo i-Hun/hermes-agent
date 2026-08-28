@@ -11,6 +11,7 @@ import pytest
 
 from tools.skill_manager_tool import (
     MAX_SKILL_CONTENT_CHARS,
+    SKILL_MD_WARN_CHARS,
     _validate_content_size,
     skill_manage,
 )
@@ -156,6 +157,77 @@ class TestWriteFileSizeLimit:
             file_content="# Normal\n\n" + ("x" * 5000),
         ))
         assert result["success"] is True
+
+
+class TestSkillMdSoftCeiling:
+    """SKILL.md over SKILL_MD_WARN_CHARS warns but never blocks."""
+
+    def test_create_under_soft_ceiling_is_silent(self, isolate_skills):
+        content = _make_skill_content(SKILL_MD_WARN_CHARS - 500)
+        result = json.loads(skill_manage(action="create", name="lean", content=content))
+        assert result["success"] is True
+        assert "size_warning" not in result
+
+    def test_create_over_soft_ceiling_warns_but_succeeds(self, isolate_skills):
+        content = _make_skill_content(SKILL_MD_WARN_CHARS + 5000)
+        result = json.loads(skill_manage(action="create", name="chunky", content=content))
+        assert result["success"] is True
+        assert "size_warning" in result
+        assert "references/" in result["size_warning"]
+        # The advisory must reach the model through the message it always reads
+        assert "size_warning" not in result["message"]
+        assert "soft" in result["message"]
+
+    def test_edit_over_soft_ceiling_warns(self, isolate_skills):
+        json.loads(skill_manage(action="create", name="grower", content=_make_skill_content(1000)))
+        big = _make_skill_content(SKILL_MD_WARN_CHARS + 1).replace(
+            "name: test-skill", "name: grower"
+        )
+        result = json.loads(skill_manage(action="edit", name="grower", content=big))
+        assert result["success"] is True
+        assert "size_warning" in result
+
+    def test_patch_crossing_soft_ceiling_warns(self, isolate_skills):
+        near = _make_skill_content(SKILL_MD_WARN_CHARS - 100)
+        json.loads(skill_manage(action="create", name="creeper", content=near))
+        result = json.loads(skill_manage(
+            action="patch",
+            name="creeper",
+            old_string="# Test Skill",
+            new_string="# Test Skill\n" + ("y" * 500),
+        ))
+        assert result["success"] is True
+        assert "size_warning" in result
+
+    def test_supporting_files_are_never_warned(self, isolate_skills):
+        """references/ is the offload target — warning there would be backwards."""
+        json.loads(skill_manage(action="create", name="ref-host", content=_make_skill_content(1000)))
+        result = json.loads(skill_manage(
+            action="write_file",
+            name="ref-host",
+            file_path="references/big.md",
+            file_content="# Big\n\n" + ("x" * (SKILL_MD_WARN_CHARS + 5000)),
+        ))
+        assert result["success"] is True
+        assert "size_warning" not in result
+
+    def test_patch_on_supporting_file_is_never_warned(self, isolate_skills):
+        json.loads(skill_manage(action="create", name="ref-patch", content=_make_skill_content(1000)))
+        json.loads(skill_manage(
+            action="write_file",
+            name="ref-patch",
+            file_path="references/data.md",
+            file_content="# Data\n\nseed",
+        ))
+        result = json.loads(skill_manage(
+            action="patch",
+            name="ref-patch",
+            old_string="seed",
+            new_string="x" * (SKILL_MD_WARN_CHARS + 5000),
+            file_path="references/data.md",
+        ))
+        assert result["success"] is True
+        assert "size_warning" not in result
 
 
 class TestHandPlacedSkillsNoLimit:

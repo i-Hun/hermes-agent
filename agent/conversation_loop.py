@@ -1749,7 +1749,12 @@ def run_conversation(
         # Counter resets whenever skill_manage is actually used.
         if (agent._skill_nudge_interval > 0
                 and "skill_manage" in agent.valid_tool_names):
-            agent._iters_since_skill += 1
+            # On the native ACP path one iteration can hide dozens of engine
+            # tool calls, so a flat +1 never reaches the threshold — see
+            # agent/acp_nudge.py.
+            from agent.acp_nudge import skill_iterations_delta
+
+            agent._iters_since_skill += skill_iterations_delta(agent)
         
         # ── Pre-API-call /steer drain ──────────────────────────────────
         # If a /steer arrived during the previous API call (while the model
@@ -6149,6 +6154,19 @@ def run_conversation(
             agent._persist_session(messages, conversation_history)
             break
 
+        # Local overlay (2026-08-07): a follow-up the ACP bridge delivered
+        # INTO the call we just finished was seen by the engine but never by
+        # Hermes' message list — and that list is what gets replayed on every
+        # later turn. Fold it in now, so the next turn does not read as an
+        # assistant obeying an instruction nobody gave. No-op on every other
+        # transport. Rationale in agent/acp_midturn_steer.
+        try:
+            from agent.acp_midturn_steer import fold_delivered_into_messages
+
+            fold_delivered_into_messages(agent, messages)
+        except Exception:
+            logger.debug("mid-turn follow-up transcript fold failed", exc_info=True)
+
         try:
             _transport = agent._get_transport()
             _normalize_kwargs = {}
@@ -7667,6 +7685,33 @@ def run_conversation(
                 except Exception:
                     logger.debug("kanban stop-loop check failed", exc_info=True)
                     _kanban_nudge = None
+
+                # Local overlay (2026-08-04): the predicate above reads Hermes'
+                # message list, which never sees a completion made by the ACP
+                # engine's own MCP call or by `hermes kanban complete` in a
+                # shell. Ask the board before claiming the task "is still
+                # running". Rationale in agent/acp_kanban_stop.
+                #
+                # Deliberately its own try: folding it into the block above
+                # would turn a missing overlay module into a SILENTLY DISABLED
+                # guard (the outer handler clears the nudge). Here a failure
+                # leaves upstream's decision untouched.
+                if _kanban_nudge:
+                    try:
+                        from agent.acp_kanban_stop import worker_already_finished
+
+                        if worker_already_finished(agent):
+                            logger.info(
+                                "kanban stop-loop nudge suppressed: task %s is "
+                                "already terminal on the board",
+                                os.environ.get("HERMES_KANBAN_TASK", ""),
+                            )
+                            _kanban_nudge = None
+                    except Exception:
+                        logger.debug(
+                            "kanban terminal-state cross-check failed",
+                            exc_info=True,
+                        )
 
                 if _kanban_nudge:
                     agent._kanban_stop_nudges = (

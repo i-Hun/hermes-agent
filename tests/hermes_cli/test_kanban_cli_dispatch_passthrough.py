@@ -23,9 +23,11 @@ def isolated_kanban_home(monkeypatch):
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
+    # NB: no ``del sys.modules["hermes_cli*"]`` force-reimport here — see the
+    # matching note in ``test_kanban_default_assignee.py``. ``HERMES_HOME`` is
+    # read at call time, and wiping the modules split module identity for the
+    # rest of the process, breaking every later test whose fixture patches a
+    # module-level attribute or the plugin-manager singleton.
     yield test_home
 
 

@@ -22,6 +22,7 @@ import copy
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
@@ -651,6 +652,20 @@ def build_memory_write_metadata(
     return {k: v for k, v in metadata.items() if v not in {None, ""}}
 
 
+def _review_kind(prompt: str) -> str:
+    """Which review just ran — for the no-change notice (local overlay)."""
+    text = str(prompt or "")
+    mem = "saving to memory" in text or "**Memory**" in text
+    skill = "skill library" in text
+    if mem and skill:
+        return "память + скиллы"
+    if skill:
+        return "скиллы"
+    if mem:
+        return "память"
+    return "ревью"
+
+
 def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
@@ -683,6 +698,9 @@ def _run_review_in_thread(
         pass
 
     review_agent = None
+    # Where the parent's native-call ledger stands before the review runs, so
+    # a fallback read of it can tell review work from the turn that preceded.
+    _ledger_mark = len(getattr(agent, "_acp_native_tool_calls", None) or [])
     review_messages: List[Dict] = []
 
     def _unregister_review_agent(agent_ref) -> None:
@@ -710,6 +728,27 @@ def _run_review_in_thread(
             except (ValueError, AttributeError):
                 pass
 
+    # Disk state of the skill + memory stores BEFORE the review runs. The
+    # provider-independent witness for what the review actually wrote — see
+    # agent.review_disk_witness for why neither the message walk nor the
+    # ledger is trustworthy on the native ACP path.
+    try:
+        from agent.review_disk_witness import snapshot_review_targets
+        _disk_before = snapshot_review_targets()
+    except Exception:
+        _disk_before = {}
+    _started_at = time.monotonic()
+    # Outcome of this pass, recorded from ``finally`` so a review that RAISED
+    # is on record too. Recording only on the success path reproduced the very
+    # bug the disk witness exists to kill: a crashed review left no record, no
+    # streak movement and a frozen ``last_run_at``, so "it blew up every time"
+    # looked exactly like "it ran and had nothing to say" — silent in chat,
+    # silent to the health guard.
+    _pass_kind = _review_kind(prompt)
+    _pass_actions: List[str] = []
+    _pass_source = "none"
+    _pass_notified = False
+    _pass_error: Optional[str] = None
     try:
         # Silence stdout/stderr for THIS worker thread only.  A process-global
         # ``contextlib.redirect_stdout(devnull)`` here would also blank
@@ -828,6 +867,13 @@ def _run_review_in_thread(
             )
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
+            # Local overlay (2026-07-26): mark the fork so the ACP client gives
+            # it its OWN one-live-bridge slot. The fork inherits the parent's
+            # session_id, so without this both compete for the same slot and
+            # "newest spawn wins" makes them SIGTERM each other mid-turn —
+            # surfacing as `ACP process exited (rc=-15) during 'initialize'`
+            # and a spurious failover to the backup model.
+            review_agent._hermes_bg_review = True
             # The review fork pins the parent's cached system prompt and keeps
             # ``tools[]`` byte-identical to the parent so its outbound request
             # hits the same provider cache prefix (see the toolset-parity note
@@ -1039,8 +1085,65 @@ def _run_review_in_thread(
             )
             actions = []
 
-        if actions:
-            summary = " · ".join(dict.fromkeys(actions))
+        if not actions:
+            # Native ACP path: the engine's tool calls never appear as `tool`
+            # messages, so the walk above finds nothing even when the review
+            # did real work. Rebuild from the engine ledger — see
+            # agent/acp_native_calls.native_review_actions.
+            try:
+                from agent.acp_native_calls import native_review_actions
+
+                actions = native_review_actions(
+                    review_agent,
+                    getattr(agent, "memory_notifications", "on"),
+                    parent=agent,
+                    since=_ledger_mark,
+                )
+            except Exception:
+                actions = []
+
+        # Local overlay (2026-07-26, Олег), second iteration. The first tried to
+        # cure the ambiguity of silence by ALWAYS printing a line, including
+        # "без изменений". That was the wrong end of the problem: measured the
+        # same day, two skill reviews patched five skills between them and both
+        # reported "без изменений", because neither the message walk nor the
+        # ledger fallback saw the fork's writes. The user was being told
+        # "nothing changed" while the skill library was being rewritten.
+        #
+        # So: detect from the FILESYSTEM, which no provider can hide from, and
+        # go back to notifying only on real change (a "nothing happened"
+        # message is noise — the user said so explicitly). Silence stays
+        # auditable via state/background-review.json instead of via chat.
+        _mode = str(getattr(agent, "memory_notifications", "on") or "on").lower()
+        _source = "messages" if actions else "none"
+        _disk_actions: List[str] = []
+        if _mode != "off":
+            try:
+                from agent.review_disk_witness import (
+                    diff_review_targets,
+                    merge_actions,
+                    snapshot_review_targets,
+                )
+
+                _disk_actions = diff_review_targets(
+                    _disk_before, snapshot_review_targets()
+                )
+                if _disk_actions:
+                    _source = "disk" if not actions else f"{_source}+disk"
+                actions = merge_actions(actions, _disk_actions)
+            except Exception as e:
+                logger.debug("review disk witness unavailable: %s", e)
+        summary = " · ".join(dict.fromkeys(actions)) if actions else ""
+        logger.info(
+            "background review finished: kind=%s actions=%d source=%s "
+            "elapsed=%.1fs notify=%s",
+            _pass_kind, len(actions), _source,
+            time.monotonic() - _started_at, bool(summary),
+        )
+        _pass_actions = list(actions)
+        _pass_source = _source
+        _pass_notified = bool(summary)
+        if summary:
             agent._safe_print(
                 f"  💾 Self-improvement review: {summary}"
             )
@@ -1055,8 +1158,23 @@ def _run_review_in_thread(
 
     except Exception as e:
         logger.warning("Background memory/skill review failed: %s", e)
+        _pass_source = "error"
+        _pass_error = f"{type(e).__name__}: {e}"
         agent._emit_auxiliary_failure("background review", e)
     finally:
+        # Record the pass FIRST — before teardown, so ``elapsed_s`` measures the
+        # review and not the Honcho flush behind it, and so a teardown that
+        # raises cannot swallow the audit record.
+        try:
+            from agent.review_disk_witness import record_review_pass
+
+            record_review_pass(
+                _pass_kind, _pass_actions, _pass_source,
+                time.monotonic() - _started_at, _pass_notified,
+                error=_pass_error,
+            )
+        except Exception:
+            pass
         # Safety-net cleanup for the exception path.  Normal completion already
         # shut down inside the thread-scoped silence above.  Re-enter the
         # thread-scoped silence here so teardown output (Honcho flush, Hindsight

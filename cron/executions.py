@@ -138,6 +138,19 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
     with _transaction() as conn:
+        # Local overlay: reconcile provably-abandoned attempts on THIS
+        # connection before claiming the next one, so recovery no longer waits
+        # for a scheduler restart. Logic (and why it is not a call to
+        # recover_interrupted_executions) lives in cron/acp_execution_recovery.
+        # Guarded here as well as inside: the import itself fails if the patch
+        # is applied without the overlay module, and audit hygiene must never
+        # be able to lose a run.
+        try:
+            from cron.acp_execution_recovery import reconcile_abandoned_unlocked
+
+            reconcile_abandoned_unlocked(conn)
+        except Exception:
+            pass
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,

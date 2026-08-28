@@ -660,6 +660,16 @@ def _format_exec_approval_fallback(
 
 def _gateway_provider_error_reply(text: str) -> str:
     """Map raw provider/API errors to a short user-safe Telegram reply."""
+    # Whitelisted, actionable envelope: a hit plan/quota window carries a
+    # chat-safe reset time worth surfacing instead of burying under "check
+    # gateway logs". Checked first (before the rate-limit branch, which would
+    # otherwise swallow "usage limit"). Only reached for text that already
+    # passed _looks_like_gateway_provider_error (short, anchored).
+    from gateway.overlay_hooks import usage_limit_reply_safe
+
+    _quota = usage_limit_reply_safe(text)
+    if _quota is not None:
+        return _quota
     if _GATEWAY_AUTH_ERROR_RE.search(text):
         return (
             "⚠️ Provider authentication failed. Check the configured credentials; "
@@ -4019,7 +4029,10 @@ class TurnRunner:
             # "💻 terminal" header so back-to-back commands render as
             # adjacent code blocks under a single header.
             _block_header = (
-                "" if ctx.last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
+                ""
+                if ctx.last_was_terminal_block[0]
+                and ctx.progress_grouping != "replace"
+                else f"{emoji} {tool_name}\n"
             )
             _code_block_full = f"{_block_header}```\n{_cmd_full}\n```"
             # Single-line, capped preview for non-verbose modes.
@@ -4334,7 +4347,22 @@ class TurnRunner:
         progress_msg_id = None   # ID of the current progress message to edit
         can_edit = ctx.progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
         _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
-        _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
+
+        # ── Collapsible history + live subagent transcripts (#67479) ──
+        # Local overlay: all logic lives in gateway/progress_collapse.py
+        # so upstream churn in this file cannot conflict with it.
+        from gateway.progress_collapse import ProgressCollapser
+        _prog = ProgressCollapser(ctx.progress_grouping, adapter)
+
+        # ── Edit-rate budget (local overlay: gateway/progress_flood.py) ──
+        # Minimum seconds between edits, widened when the platform says the
+        # rail is too fast. Replaces a fixed 1.5s, which is ~40 edits/min —
+        # over any group's budget for the length of a tool-heavy run.
+        from gateway.progress_flood import (
+            ProgressFloodBudget,
+            flood_retry_after as _flood_retry_after,
+        )
+        _flood = ProgressFloodBudget()
 
         _progress_len_fn = (
             adapter.message_len_fn
@@ -4518,10 +4546,11 @@ class TurnRunner:
                     progress_lines = []
                     ctx.last_progress_msg[0] = None
                     ctx.repeat_count[0] = 0
+                    _prog.on_content_bubble()
                     continue
                 else:
                     msg = raw
-                    progress_lines.append(msg)
+                    progress_lines = _prog.append(progress_lines, msg)
 
                 if await _roll_progress_overflow_if_needed():
                     _last_edit_ts = time.monotonic()
@@ -4535,7 +4564,7 @@ class TurnRunner:
                 # (grammY auto-retry pattern: proactively rate-limit
                 # instead of reacting to 429s.)
                 _now = time.monotonic()
-                _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
+                _remaining = _flood.interval - (_now - _last_edit_ts)
                 if _remaining > 0:
                     # Wait out the throttle interval, then loop back to
                     # drain any additional queued messages before sending
@@ -4548,31 +4577,43 @@ class TurnRunner:
 
                 if can_edit and progress_msg_id is not None:
                     # Try to edit the existing progress message
-                    full_text = "\n".join(progress_lines)
+                    full_text = _prog.render(progress_lines)
                     result = await _edit_progress_message(progress_msg_id, full_text)
                     if not result.success:
-                        _err = (getattr(result, "error", "") or "").lower()
-                        # Transient network errors (ConnectError, timeouts)
-                        # must not permanently disable progress-message
-                        # editing — the next cycle can catch up.  Only
-                        # permanent failures (flood control, message not
-                        # found, permissions) should set can_edit = False.
-                        if getattr(result, "retryable", False):
+                        # Classification lives in the overlay module; only
+                        # permanent failures (message deleted, bot kicked,
+                        # no edit permission) may retire the bubble.
+                        _kind = _flood.classify(result)
+                        if _kind == "transient":
+                            # Transient network errors (ConnectError,
+                            # timeouts) must not permanently disable
+                            # progress-message editing — the next cycle can
+                            # catch up.
                             logger.debug(
                                 "[%s] Transient edit failure — keeping can_edit=True",
                                 adapter.name,
                             )
                             continue
-                        if "flood" in _err or "retry after" in _err:
-                            # Flood control hit — backoff but keep editing.
-                            # Only disable edits for non-recoverable errors.
-                            logger.info(
-                                "[%s] Progress edit flood control, backing off",
-                                adapter.name,
+                        if _kind == "flood":
+                            # Rate limit — hold the rail and keep editing.
+                            # The line is already in progress_lines, so the
+                            # next successful edit shows it; sending it as
+                            # its own message instead would fragment the
+                            # bubble AND spend the exhausted budget.
+                            _hold = _flood.on_flood(
+                                getattr(result, "retry_after", None)
+                                or _flood_retry_after(getattr(result, "error", ""))
                             )
-                            _last_edit_ts = time.monotonic()
-                        else:
-                            can_edit = False
+                            logger.info(
+                                "[%s] Progress edit flood control — holding %.1fs, "
+                                "cadence now %.1fs (bubble kept)",
+                                adapter.name, _hold, _flood.interval,
+                            )
+                            _last_edit_ts = (
+                                time.monotonic() + _hold - _flood.interval
+                            )
+                            continue
+                        can_edit = False
                         _flood_result = await adapter.send(
                             chat_id=ctx.source.chat_id,
                             content=msg,
@@ -4588,7 +4629,7 @@ class TurnRunner:
                 else:
                     if can_edit:
                         # First tool: send all accumulated text as new message
-                        full_text = "\n".join(progress_lines)
+                        full_text = _prog.render(progress_lines)
                         result = await adapter.send(
                             chat_id=ctx.source.chat_id,
                             content=full_text,
@@ -4616,6 +4657,24 @@ class TurnRunner:
                     await adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
 
             except queue.Empty:
+                # Live subagent tail (#67479) — logic in
+                # gateway/progress_collapse.py (local overlay).
+                _st = await _prog.refresh_tail_io(
+                    progress_lines,
+                    active=can_edit and ctx._run_still_current(),
+                    throttle_ok=(
+                        time.monotonic() - _last_edit_ts
+                    ) >= _flood.interval,
+                    message_id=progress_msg_id,
+                    edit_fn=_edit_progress_message,
+                    send_fn=_send_progress_text,
+                    logger=logger,
+                )
+                if _st is not None:
+                    progress_msg_id, _can_still_edit = _st
+                    if not _can_still_edit:
+                        can_edit = False
+                    _last_edit_ts = time.monotonic()
                 await asyncio.sleep(0.3)
             except asyncio.CancelledError:
                 # Drain remaining queued messages
@@ -4863,7 +4922,17 @@ class TurnRunner:
         )
         if _fut is None:
             return
-        if ctx._cleanup_progress:
+        # Local overlay call-out: a durable status (model/provider switch) is
+        # not turn progress and must outlive the sweep that deletes progress
+        # bubbles. Rationale and the measured symptom in
+        # gateway.status_durability.
+        try:
+            from gateway.status_durability import is_durable as _status_is_durable
+        except Exception:
+            _status_is_durable = None
+        if ctx._cleanup_progress and not (
+            _status_is_durable is not None and _status_is_durable(event_type)
+        ):
             def _track_status_id(fut) -> None:
                 try:
                     res = fut.result()
@@ -5413,7 +5482,15 @@ class TurnRunner:
         _bg_review_pending_lock = threading.Lock()
 
         def _deliver_bg_review_message(message: str) -> None:
-            if not ctx._status_adapter or not ctx._run_still_current():
+            # Deliberately NOT gated on _run_still_current(). The review
+            # runs in the background for a minute or more AFTER the answer
+            # was delivered, and every new user turn bumps the run
+            # generation — so in an active conversation the notice was
+            # almost always discarded as "stale" and the user never saw
+            # "Self-improvement review" at all (reported 2026-07-25).
+            # It is a standalone, non-conversational notice about work that
+            # already happened, so a newer turn does not invalidate it.
+            if not ctx._status_adapter:
                 return
             safe_schedule_threadsafe(
                 ctx._status_adapter.send(
@@ -5436,7 +5513,7 @@ class TurnRunner:
 
         # Background review delivery — send "💾 Memory updated" etc. to user
         def _bg_review_send(message: str) -> None:
-            if not ctx._status_adapter or not ctx._run_still_current():
+            if not ctx._status_adapter:
                 return
             if not _bg_review_release.is_set():
                 with _bg_review_pending_lock:
@@ -9361,6 +9438,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter = self._adapter_for_source(event.source)
         if not adapter:
             return
+        # Local overlay: thin hook → agent/telegram_message_edits.py. A
+        # Telegram edit re-enters the inbound path as a fresh event; when the
+        # original is still queued, replace it instead of queueing a twin.
+        from gateway.overlay_hooks import telegram_edit_absorbed
+
+        if telegram_edit_absorbed(self, session_key, event, adapter):
+            return
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
@@ -9651,6 +9735,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _steer_all_voice = bool(_steer_media_urls) and (
                 len(self._pending_event_audio_paths(event)) == len(_steer_media_urls)
             )
+            from gateway.overlay_hooks import acp_steer_lands_this_turn
+
             can_steer = (
                 steer_text
                 and (
@@ -9664,6 +9750,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and running_agent is not None
                 and running_agent is not _AGENT_PENDING_SENTINEL
                 and hasattr(running_agent, "steer")
+                # Local overlay: thin hook → agent/acp_busy_followup.py. With
+                # native ACP tool-calling there is no tool message to append the
+                # steer to, so it would be stashed and then dropped. Answer no
+                # and the block below falls back to queue semantics, which do
+                # deliver.
+                and acp_steer_lands_this_turn(running_agent)
             )
             if can_steer:
                 try:
@@ -15969,12 +16061,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # is empty, the agent lacks steer(), or steer() rejects.
                 steer_text = (event.text or "").strip()
                 steered = False
+                from gateway.overlay_hooks import acp_steer_lands_this_turn
+
                 if (
                     event.message_type == MessageType.TEXT
                     and not event.media_urls
                     and not event.media_types
                     and steer_text
                     and hasattr(running_agent, "steer")
+                    # Local overlay: same landing-site check as the busy-handler
+                    # path → agent/acp_busy_followup.py.
+                    and acp_steer_lands_this_turn(running_agent)
                 ):
                     try:
                         steered = bool(running_agent.steer(steer_text))
@@ -24778,7 +24875,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
-        if adapter and hasattr(adapter, "get_pending_message"):
+        # Local overlay: thin hook → agent/acp_busy_followup.py. On ``/stop``
+        # the follow-up queued for this session is the very message the
+        # operator is waiting on — discarding it here deleted it silently and
+        # forced him to retype it (measured twice, secretary, 2026-08-06).
+        # Hand it back instead; upstream's own
+        # ``_drain_pending_after_session_command`` (called at the tail of /stop
+        # dispatch) then starts it as the next turn. ``/new`` / ``/reset`` still
+        # discard — there "forget it" is the point.
+        _acp_owed_events: list = []
+        if adapter is not None:
+            try:
+                from agent.acp_busy_followup import (
+                    capture_pending_events as _acp_capture_pending,
+                    should_redeliver as _acp_should_redeliver,
+                )
+                if _acp_should_redeliver(invalidation_reason):
+                    _acp_owed_events = _acp_capture_pending(self, session_key, adapter)
+            except Exception:
+                _acp_owed_events = []
+        if adapter and hasattr(adapter, "get_pending_message") and not _acp_owed_events:
             adapter.get_pending_message(session_key)  # consume and discard
         if _iac_state is not None:
             _iac_state.persistent.pending_command_text = None
@@ -24794,6 +24910,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # object keeps its interrupt flag so a hung drain still dies
             # when it unblocks.
             self._evict_cached_agent(session_key)
+        # Restore AFTER the state release: releasing resets the session's
+        # overflow tail, so putting the events back earlier would drop
+        # everything past the first one.
+        if _acp_owed_events:
+            try:
+                from agent.acp_busy_followup import restore_pending_events as _acp_restore
+                if _acp_restore(self, session_key, adapter, _acp_owed_events):
+                    logger.info(
+                        "Handing %d queued follow-up(s) back to session %s after %s "
+                        "instead of discarding them",
+                        len(_acp_owed_events), session_key, invalidation_reason,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to hand queued follow-ups back for session %s: %s",
+                    session_key, exc,
+                )
 
     async def _refresh_agent_cache_message_count(
         self, session_key: str, session_id: Optional[str]
@@ -28954,7 +29087,24 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     
     args = parser.parse_args()
-    
+
+    # Local overlay: thin hook → agent/acp_config.py. A gateway that answers on
+    # a model nobody chose is worse than one that refuses to start and says so,
+    # so a second source of truth for HERMES_ACP_MODEL / _NATIVE_TOOLS is fatal
+    # here (and only here — CLI runs may override deliberately).
+    try:
+        from agent.acp_config import ACPConfigError, enforce as _acp_config_enforce
+    except Exception:
+        ACPConfigError, _acp_config_enforce = None, None
+    if _acp_config_enforce is not None:
+        try:
+            _acp_config_enforce("gateway")
+        except ACPConfigError as exc:
+            print(f"FATAL: {exc}", file=sys.stderr, flush=True)
+            sys.exit(78)  # EX_CONFIG
+        except Exception:
+            pass
+
     config = None
     if args.config:
         import yaml

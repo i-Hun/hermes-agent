@@ -129,7 +129,18 @@ def test_pending_fallback_notice_emitted_once_on_success():
     though the noisy retry buffer is dropped."""
     agent = _make_bare_agent()
     emitted = []
-    agent._emit_status = lambda msg: emitted.append(msg)
+    kinds = []
+
+    # ``**kw``: the notice is emitted under a durable status kind so the
+    # gateway's post-turn cleanup sweep does not delete it (see
+    # gateway/status_durability.py). A single-positional stub would swallow
+    # that as a TypeError inside _emit_pending_fallback_notice's own
+    # exception guard and read as "emitted nothing".
+    def _emit(msg, **kw):
+        emitted.append(msg)
+        kinds.append(kw.get("event_type", "lifecycle"))
+
+    agent._emit_status = _emit
 
     # Simulate try_activate_fallback: buffer the noisy switch line AND record
     # the durable one-shot notice.
@@ -143,6 +154,7 @@ def test_pending_fallback_notice_emitted_once_on_success():
     # The durable notice was shown exactly once; the buffered retry noise was
     # silently dropped.
     assert emitted == ["🔄 Switched to fallback model: m1 via p1 → m2 via p2"]
+    assert kinds == ["model_switch"]
     assert agent._retry_status_buffer == []
     # Notice is cleared so it cannot re-emit on a later turn.
     assert agent._pending_fallback_notice is None

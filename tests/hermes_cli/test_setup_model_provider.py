@@ -103,7 +103,7 @@ def test_setup_copilot_acp_skips_same_provider_pool_step(tmp_path, monkeypatch):
 
     def fake_prompt_choice(question, choices, default=0):
         if question == "Select your inference provider:":
-            return 15  # GitHub Copilot ACP
+            return 15  # Claude (ACP bridge) — slug copilot-acp
         if question == "Select default model:":
             return 0
         if question == "Configure vision:":

@@ -300,7 +300,9 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
     ),
     "copilot-acp": ProviderConfig(
         id="copilot-acp",
-        name="GitHub Copilot ACP",
+        # See _LABEL_OVERRIDES in hermes_cli/providers.py — the ACP command is
+        # configurable and need not be copilot.
+        name="Claude (ACP bridge)",
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",

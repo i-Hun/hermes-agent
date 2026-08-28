@@ -292,14 +292,35 @@ class CronPromptInjectionBlocked(Exception):
     """
 
 
+def _cron_memory_enabled(cfg: dict) -> bool:
+    """Whether cron-spawned agents get the external memory provider.
+
+    Upstream hard-disables memory in cron (``skip_memory=True``) because a
+    cron system prompt has no human turn: an auto-updating *user
+    representation* (MEMORY.md / USER.md) would absorb job text as if the
+    user had said it. That reason is specific to the built-in file-backed
+    store, which stays off here regardless — the ``memory`` toolset remains
+    on the cron denylist below, so nothing can write USER.md from a cron run.
+
+    An external provider (Hindsight) is a different object: a per-profile
+    bank, not a representation of the user. Opting in via
+    ``cron.memory_enabled: true`` lets scheduled work read from and land in
+    that bank. Default False keeps upstream behaviour for anyone who has not
+    opted in.
+    """
+    return bool(((cfg or {}).get("cron") or {}).get("memory_enabled", False))
+
+
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
     Three toolsets are always disabled in cron context regardless of config:
       - ``messaging`` — interactive, needs a live gateway session
       - ``clarify`` — interactive, blocks waiting for user input
-      - ``memory`` — cron agents are constructed with ``skip_memory=True``, so
-        exposing this tool only gives the model an unbacked tool that fails
+      - ``memory`` — the built-in file-backed store (MEMORY.md / USER.md) is
+        never writable from cron: with ``cron.memory_enabled`` off the store
+        is not even built, and with it on the store exists but must stay
+        read-only, since a job prompt is not something the user said
 
     ``cronjob`` is policy-denied by default (loop prevention, not a security
     boundary) and config-gated: setting ``cron.allow_agent_scheduling: true``
@@ -4387,7 +4408,11 @@ def run_job(
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            skip_memory=True,  # Cron system prompts would corrupt user representations
+            # Off by default (upstream: cron system prompts would corrupt user
+            # representations). `cron.memory_enabled: true` opts the external
+            # memory provider back in; the built-in store stays unreachable
+            # because the `memory` toolset is on the cron denylist either way.
+            skip_memory=not _cron_memory_enabled(_cfg),
             skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
             platform="cron",
             session_id=_cron_session_id,

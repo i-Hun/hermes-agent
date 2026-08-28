@@ -1320,6 +1320,8 @@ def try_recover_primary_transport(
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
+        from agent.agent_init import reapply_custom_provider_extra_body
+        reapply_custom_provider_extra_body(agent)
 
         if agent.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client
@@ -1551,6 +1553,8 @@ def restore_primary_runtime(agent) -> bool:
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
         agent._client_kwargs = dict(rt["client_kwargs"])
+        from agent.agent_init import reapply_custom_provider_extra_body
+        reapply_custom_provider_extra_body(agent)
         agent._use_prompt_caching = rt["use_prompt_caching"]
         # Default to native layout when the restored snapshot predates the
         # native-vs-proxy split (older sessions saved before this PR).
@@ -2363,6 +2367,10 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         from agent.copilot_acp_client import CopilotACPClient
 
         client = CopilotACPClient(**client_kwargs)
+        # Let the ACP client relay engine-internal activity (thinking
+        # narration, native tool calls) to this agent's progress rail; the
+        # per-turn callback is resolved lazily inside the client.
+        client._activity_agent = agent
         _ra().logger.info(
             "Copilot ACP client created (%s, shared=%s) %s",
             reason,
@@ -2763,6 +2771,12 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # switch (the policy would read the stale init-time snapshot).
     if _sm_custom_providers is not None:
         agent._custom_providers = _sm_custom_providers
+    # The destination endpoint has its own ``extra_body`` (or none) — re-merge
+    # so a switch onto a custom provider actually sends it, and a switch away
+    # stops sending the previous one's.  Init-only merging left switched
+    # sessions silently mis-bodied until restart.
+    from agent.agent_init import reapply_custom_provider_extra_body
+    reapply_custom_provider_extra_body(agent)
     agent._use_prompt_caching, agent._use_native_cache_layout = (
         agent._anthropic_prompt_cache_policy(
             provider=new_provider,

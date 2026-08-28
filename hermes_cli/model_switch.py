@@ -1345,6 +1345,21 @@ def switch_model(
     target_provider = current_provider
     resolved_moa_preset = False
 
+    # Local overlay call-out: keep a claude-* switch on an ACP profile's bridge
+    # instead of resolving it to the direct Anthropic API. Rationale, measured
+    # symptom and the pin move below live in agent/acp_model_choice.
+    try:
+        from agent.acp_model_choice import coerce_switch as _acp_coerce_switch
+    except Exception:
+        _acp_coerce_switch = None
+    if _acp_coerce_switch is not None:
+        _acp_forced, _acp_error = _acp_coerce_switch(
+            new_model, explicit_provider, current_provider
+        )
+        if _acp_error:
+            return ModelSwitchResult(success=False, error_message=_acp_error)
+        explicit_provider = _acp_forced or explicit_provider
+
     # =================================================================
     # PATH A: Explicit --provider given
     # =================================================================
@@ -1923,6 +1938,22 @@ def switch_model(
     hermes_warn = _check_hermes_model_warning(new_model)
     if hermes_warn:
         warnings.append(hermes_warn)
+
+    # Local overlay call-out: drop the curated-catalog note on the ACP route —
+    # the bridge is not Copilot and has no catalog, so that note fires on every
+    # healthy switch. Adds nothing routine. Rationale in agent/acp_model_choice.
+    try:
+        from agent.acp_model_choice import filter_switch_warnings as _acp_warnings
+    except Exception:
+        pass
+    else:
+        warnings = _acp_warnings(
+            new_model=new_model,
+            target_provider=target_provider,
+            current_provider=current_provider,
+            warnings=warnings,
+            catalog_note=validation.get("message") or "",
+        )
 
     # --- Build result ---
     return ModelSwitchResult(
@@ -3345,6 +3376,22 @@ def list_picker_providers(
     )
     if include_moa:
         providers = _prepend_moa_picker_provider(providers, current_provider=current_provider)
+
+    # Local overlay call-out: an ACP profile's models are served by the bridge,
+    # which has no curated catalog of its own and so had no picker row at all.
+    # Adds it, and takes the ids it serves off the direct-API row where a
+    # subscription login 400s. Rationale in agent/acp_model_choice.picker_rows.
+    try:
+        from agent.acp_model_choice import picker_rows as _acp_picker_rows
+    except Exception:
+        pass
+    else:
+        providers = _acp_picker_rows(
+            providers,
+            current_provider=current_provider,
+            current_model=current_model,
+            max_models=max_models,
+        )
 
     filtered: List[dict] = []
     for p in providers:

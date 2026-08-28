@@ -1478,7 +1478,12 @@ def drain_truncation_warnings() -> list:
 # =========================================================================
 
 _SKILLS_PROMPT_CACHE_MAX = 8
-_SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
+# Entries are (rendered_prompt, manifest): the manifest is the same mtime/size
+# fingerprint the disk snapshot uses, revalidated on every hit. Without it a
+# long-lived process (the gateway) served its first index forever, so a skill
+# written by another process — skill_manage from an ACP backend, a hand edit,
+# git pull, hermes-patch-update — stayed invisible in the prompt until restart.
+_SKILLS_PROMPT_CACHE: OrderedDict[tuple, tuple[str, dict[str, list[int]]]] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 # v2: entries gained org provenance fields (org_id/org_author/rel_dir) for M2
 # org-shared skills; older snapshots are discarded and rebuilt.
@@ -1759,11 +1764,19 @@ def build_skills_system_prompt(
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
     )
+    # A cache hit is only honoured while the skills directory still looks the
+    # way it did when the entry was rendered. The walk is ~3.5 ms for ~120
+    # skills — noise next to a model turn, and the only thing that makes the
+    # LRU correct for writers living in a different process.
+    live_manifest = _build_skills_manifest(skills_dir)
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
         if cached is not None:
-            _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
-            return cached
+            cached_result, cached_manifest = cached
+            if cached_manifest == live_manifest:
+                _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
+                return cached_result
+            del _SKILLS_PROMPT_CACHE[cache_key]
 
     # ── Layer 2: disk snapshot ────────────────────────────────────────
     snapshot = _load_skills_snapshot(skills_dir)
@@ -1997,8 +2010,11 @@ def build_skills_system_prompt(
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────
+    # Stored against the manifest read BEFORE the scan on purpose: if a skill
+    # landed mid-scan the fingerprints differ on the next call and we rebuild.
+    # Erring towards a wasted rebuild, never towards serving a stale index.
     with _SKILLS_PROMPT_CACHE_LOCK:
-        _SKILLS_PROMPT_CACHE[cache_key] = result
+        _SKILLS_PROMPT_CACHE[cache_key] = (result, live_manifest)
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
         while len(_SKILLS_PROMPT_CACHE) > _SKILLS_PROMPT_CACHE_MAX:
             _SKILLS_PROMPT_CACHE.popitem(last=False)

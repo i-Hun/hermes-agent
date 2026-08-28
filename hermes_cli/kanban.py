@@ -250,6 +250,31 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- init ---
     sub.add_parser("init", help="Create kanban.db if missing (idempotent)")
 
+    # --- db-path ---
+    # Read-only path oracle. Exists because the DB file for the default
+    # board lives at <root>/kanban.db while the sibling <root>/kanban/
+    # directory holds workspaces/logs/attachments — an agent that guesses
+    # "<root>/kanban/kanban.db" and pokes it with plain `sqlite3` silently
+    # creates a 0-byte file and concludes the board is empty. Printing the
+    # canonical path removes the guess.
+    p_db_path = sub.add_parser(
+        "db-path",
+        aliases=["paths"],
+        help="Print the canonical kanban.db path (no guessing, no writes)",
+        description=(
+            "Print the absolute path of the board's SQLite database. "
+            "Never creates or modifies anything — safe to call on any "
+            "board. Read the DB with `sqlite3 -readonly \"$(hermes kanban "
+            "db-path)\"` so a wrong path errors out instead of silently "
+            "creating an empty file."
+        ),
+    )
+    p_db_path.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the DB path plus the board's workspaces/logs/attachments roots",
+    )
+
     # --- boards (new in v2: multi-project support) ---
     p_boards = sub.add_parser(
         "boards",
@@ -1099,6 +1124,11 @@ def kanban_command(args: argparse.Namespace) -> int:
         # without ever reaching the repair path.
         if action == "repair":
             return _cmd_repair(args)
+        # `db-path` must also dispatch before auto-init: its whole point is
+        # to be a side-effect-free oracle you can call while diagnosing a
+        # board you suspect is missing or corrupt.
+        if action in {"db-path", "paths"}:
+            return _cmd_db_path(args)
         try:
             kb.init_db()
         except Exception as exc:
@@ -1502,6 +1532,38 @@ def _cmd_init(args: argparse.Namespace) -> int:
         "by default (config: kanban.dispatch_interval_seconds). Without a\n"
         "running gateway, tasks stay in 'ready' forever."
     )
+    return 0
+
+
+def _cmd_db_path(args: argparse.Namespace) -> int:
+    """Print the canonical DB path for the active (or ``--board``) board.
+
+    Deliberately side-effect free: no ``init_db()``, no ``connect()``, no
+    ``mkdir``. The plain form prints exactly one line so it composes:
+
+        sqlite3 -readonly "$(hermes kanban db-path)" 'select count(*) from tasks;'
+
+    ``--json`` adds the sibling per-board roots and where the path came
+    from, which is what you actually want when a board looks empty and
+    you're deciding whether you're on the wrong board or the wrong file.
+    """
+    board = kb.get_current_board()
+    path = kb.kanban_db_path()
+    if not getattr(args, "json", False):
+        print(path)
+        return 0
+    env_pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    payload = {
+        "board": board,
+        "db_path": str(path),
+        "exists": path.exists(),
+        "size_bytes": path.stat().st_size if path.exists() else 0,
+        "source": "HERMES_KANBAN_DB" if env_pin else "board",
+        "workspaces_root": str(kb.workspaces_root()),
+        "logs_dir": str(kb.worker_logs_dir()),
+        "attachments_root": str(kb.attachments_root()),
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -3339,6 +3401,7 @@ Common subcommands:
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
+  `db-path`             Canonical kanban.db path — never guess it
   `assignees`           Known profiles + counts
   `context <id>`        Full worker-context dump
   `runs <id>`           Attempt history

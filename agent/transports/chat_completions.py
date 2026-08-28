@@ -10,6 +10,7 @@ reasoning configuration, temperature handling, and extra_body assembly.
 """
 
 import json
+import logging
 from typing import Any, Dict
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
@@ -17,6 +18,8 @@ from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
+
+logger = logging.getLogger(__name__)
 
 
 def _static_prompt_instructions(messages: list[dict[str, Any]]) -> str:
@@ -755,6 +758,24 @@ class ChatCompletionsTransport(ProviderTransport):
         unified format) and reasoning_content (DeepSeek/Moonshot) are also
         preserved for downstream replay.
         """
+        # Guard against malformed responses (e.g. from Relay serialization,
+        # string returns from broken adapters, etc.) — fail gracefully
+        # instead of crashing with AttributeError on .choices.
+        if response is None or not hasattr(response, "choices") or not response.choices:
+            logger.warning(
+                "ChatCompletionsTransport.normalize_response received invalid response "
+                "(type=%s, value=%r) — returning empty NormalizedResponse",
+                type(response).__name__ if response is not None else "None",
+                response,
+            )
+            return NormalizedResponse(
+                content=None,
+                tool_calls=None,
+                finish_reason="error",
+                reasoning=None,
+                usage=None,
+                provider_data=None,
+            )
         choice = response.choices[0]
         msg = choice.message
         # Poolside returns integer finish_reason (e.g. 24) instead of string

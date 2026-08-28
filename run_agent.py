@@ -961,12 +961,17 @@ class AIAgent:
             and getattr(self, "platform", "") == "cli"
         )
 
-    def _emit_status(self, message: str) -> None:
+    def _emit_status(self, message: str, *, event_type: str = "lifecycle") -> None:
         """Emit a lifecycle status message to both CLI and gateway channels.
 
         CLI users see the message via ``_vprint(force=True)`` so it is always
         visible regardless of verbose/quiet mode.  Gateway consumers receive
         it through ``status_callback("lifecycle", ...)``.
+
+        ``event_type`` overrides that key for the few statuses that are not
+        turn progress.  It reaches the gateway as both the cleanup class and
+        the edit-in-place bubble key — see ``gateway.status_durability`` for
+        why a model switch needs its own.  CLI rendering is unaffected.
 
         This helper never raises — exceptions are swallowed so it cannot
         interrupt the retry/fallback logic.
@@ -977,7 +982,7 @@ class AIAgent:
             pass
         if self.status_callback:
             try:
-                self.status_callback("lifecycle", message)
+                self.status_callback(event_type, message)
             except Exception:
                 logger.debug("status_callback error in _emit_status", exc_info=True)
 
@@ -1161,7 +1166,16 @@ class AIAgent:
                 # Clear before emitting so a (swallowed) callback error can't
                 # leave the notice set for a stale re-emit on a later turn.
                 self._pending_fallback_notice = None
-                self._emit_status(notice)
+                # Durable kind, not "lifecycle": the gateway's post-turn
+                # cleanup sweep deletes progress bubbles, and this notice was
+                # being deleted along with them — the very outcome the
+                # docstring above promises it prevents. See
+                # gateway.status_durability.
+                try:
+                    from gateway.status_durability import MODEL_SWITCH as _kind
+                except Exception:
+                    _kind = "lifecycle"
+                self._emit_status(notice, event_type=_kind)
         except Exception:
             # Never break the conversation loop on a notice hiccup.
             pass

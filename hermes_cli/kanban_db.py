@@ -92,6 +92,14 @@ from typing import Any, Iterable, Mapping, Optional
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
+try:  # overlay: boundary-aware handoff excerpts (see hermes_cli/kanban_handoff.py)
+    from hermes_cli.kanban_handoff import handoff_payload_excerpt
+except Exception:  # pragma: no cover - overlay absent, keep upstream behaviour
+
+    def handoff_payload_excerpt(text: object) -> str:
+        lines = str(text or "").strip().splitlines()
+        return lines[0][:400] if lines else ""
+
 _log = logging.getLogger(__name__)
 
 
@@ -133,6 +141,36 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+
+def awaiting_human_after_block_loop(task: "Task") -> bool:
+    """True when this triage task was escalated there by the loop breaker.
+
+    ``block_task`` routes a repeatedly-human-blocked task to ``triage`` (see
+    :data:`BLOCK_RECURRENCE_LIMIT`) precisely to take it *out* of the machine
+    loop until a human weighs in. But ``triage`` is also the auto-decomposer's
+    input queue, and the specify/decompose sweep re-specifies whatever sits
+    there and promotes it back to ``todo`` — handing the card straight back to
+    a worker that already reported it cannot proceed without a human.
+
+    Observed loop (card t_aca5ab55, 9 cycles in ~4h): worker
+    ``kanban_block(kind='capability')`` → ``block_loop_detected`` → triage →
+    auto-decompose ``specified``/``promoted`` ~60s later → worker respawns →
+    blocks for the same reason. Each cycle burns an aux-LLM call, a worker run
+    and a near-identical kanban notification.
+
+    The escalated state is durable on the row: ``block_kind`` stays set to the
+    human kind and ``block_recurrences`` stays at/above the limit until a
+    successful ``complete_task`` clears them. A card a user dropped into triage
+    by hand has ``block_kind IS NULL`` and ``block_recurrences = 0``, so it is
+    unaffected.
+    """
+    return (
+        task.status == "triage"
+        and task.block_kind is not None
+        and task.block_kind != "dependency"
+        and task.block_recurrences >= BLOCK_RECURRENCE_LIMIT
+    )
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -5485,8 +5523,7 @@ def complete_task(
         event_summary = summary if summary is not None else result
         if prior_status == "review" and not event_summary:
             event_summary = "Review approved without additional evidence."
-        _ev_lines = (event_summary or "").strip().splitlines()
-        ev_summary = _ev_lines[0][:400] if _ev_lines else ""
+        ev_summary = handoff_payload_excerpt(event_summary or "")
         completed_payload: dict = {
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
@@ -6108,8 +6145,7 @@ def edit_completed_task_result(
                     "UPDATE task_runs SET metadata = ? WHERE id = ?",
                     (json.dumps(metadata, ensure_ascii=False), run_id),
                 )
-        _ev_lines = (handoff_summary or "").strip().splitlines()
-        ev_summary = _ev_lines[0][:400] if _ev_lines else ""
+        ev_summary = handoff_payload_excerpt(handoff_summary)
         _append_event(
             conn, task_id, "edited",
             {
@@ -6659,7 +6695,7 @@ def promote_task(
     force: bool = False,
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Manually promote a `todo` or `blocked` task to `ready`.
+    """Manually promote a `todo`, `blocked` or `triage` task to `ready`.
 
     Mirrors the automatic promotion done by ``recompute_ready`` but
     drives it from a deliberate operator action with an audit-trail
@@ -6668,6 +6704,19 @@ def promote_task(
     assignee or claim state. Returns ``(True, None)`` on success and
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
+
+    ``triage`` is accepted because it is the only door back for a card the
+    loop breaker escalated there (see :func:`awaiting_human_after_block_loop`):
+    the specify/decompose sweep deliberately skips those cards, ``unblock``
+    only applies to ``blocked``/``scheduled``, and re-specifying by id costs an
+    aux-LLM rewrite of a card whose text is already correct. Promotion is that
+    human decision, recorded as an event.
+
+    ``block_kind``/``block_recurrences`` are deliberately NOT reset — the
+    counter is amnesia-proof by design (see :func:`unblock_task`). If the
+    worker re-blocks for the same human reason, the card lands straight back
+    in ``triage`` instead of burning another unblock↔re-block cycle. Only a
+    successful :func:`complete_task` clears the counter.
     """
     row = conn.execute(
         "SELECT status FROM tasks WHERE id = ?", (task_id,)
@@ -6676,10 +6725,10 @@ def promote_task(
         return False, f"task {task_id} not found"
 
     cur_status = row["status"]
-    if cur_status not in ("todo", "blocked"):
+    if cur_status not in ("todo", "blocked", "triage"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'todo', 'blocked' or 'triage'"
         )
 
     if not force:
@@ -6702,20 +6751,28 @@ def promote_task(
     if dry_run:
         return True, None
 
+    released_escalation = bool(
+        cur_status == "triage" and awaiting_human_after_block_loop(get_task(conn, task_id))
+    )
+
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
+            "WHERE id = ? AND status IN ('todo', 'blocked', 'triage')",
             (task_id,),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
-        _append_event(
-            conn,
-            task_id,
-            "promoted_manual",
-            {"actor": actor, "reason": reason, "forced": force},
-        )
+        payload: dict[str, object] = {
+            "actor": actor,
+            "reason": reason,
+            "forced": force,
+            "from_status": cur_status,
+        }
+        if released_escalation:
+            # Audit trail for "a human weighed in on a loop-breaker escalation".
+            payload["released_escalation"] = True
+        _append_event(conn, task_id, "promoted_manual", payload)
 
     return True, None
 
@@ -9057,9 +9114,11 @@ def _record_task_failure(
       counter; if the breaker trips, the task is re-transitioned
       into ``blocked`` and a ``gave_up`` event is emitted.
 
-    ``event_payload_extra`` merges into the ``gave_up`` event payload
-    when the breaker trips, so callers can include outcome-specific
-    context (e.g. pid on crash, elapsed on timeout).
+    ``event_payload_extra`` merges into the emitted event payload — the
+    ``gave_up`` event when the breaker trips, and the ``<outcome>`` event
+    on the below-threshold ``end_run`` path — so callers can include
+    outcome-specific context (e.g. pid on crash, elapsed on timeout,
+    budget_used/budget_max on iteration-budget exhaustion).
 
     Resolution order for the effective threshold:
       1. per-task ``max_retries`` if set (nothing else overrides)
@@ -9175,23 +9234,35 @@ def _record_task_failure(
                 )
             if end_run:
                 # Spawn path: close the open run with outcome.
+                # ``event_payload_extra`` carries the outcome-specific context
+                # the caller measured (budget_used/budget_max on the iteration
+                # -budget exit, pid on crash). It has to land here too, not
+                # only on the breaker-trip branch: below the threshold this is
+                # the ONLY event emitted, so dropping the extras left readers
+                # with a bare error string and notifiers with no cause to
+                # render — that is how a budget exhaustion surfaced as the
+                # nonsense "max_runtime=0s".
+                metadata = {
+                    "failures": failures,
+                    "retry_status": retry_status,
+                }
+                if event_payload_extra:
+                    metadata.update(event_payload_extra)
                 run_id = _end_run(
                     conn, task_id,
                     outcome=outcome, status=outcome,
                     error=error[:500],
-                    metadata={
-                        "failures": failures,
-                        "retry_status": retry_status,
-                    },
+                    metadata=metadata,
                 )
+                payload = {
+                    "error": error[:500],
+                    "failures": failures,
+                    "retry_status": retry_status,
+                }
+                if event_payload_extra:
+                    payload.update(event_payload_extra)
                 _append_event(
-                    conn, task_id, outcome,
-                    {
-                        "error": error[:500],
-                        "failures": failures,
-                        "retry_status": retry_status,
-                    },
-                    run_id=run_id,
+                    conn, task_id, outcome, payload, run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
     return blocked

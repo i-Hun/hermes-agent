@@ -729,13 +729,41 @@ def finalize_turn(
     # Clear stream callback so it doesn't leak into future calls
     agent._stream_callback = None
 
+    # Local overlay: on the ACP path the unit of work is the engine's own tool
+    # calls, and they are only knowable once the turn is over — see
+    # agent/acp_nudge.py for why the counter is durable and profile-wide there.
+    # Off ACP this is a no-op and the count below is the upstream one.
+    try:
+        from agent.acp_nudge import finalize_turn as _acp_nudge_finalize_turn
+
+        _acp_nudge_finalize_turn(agent)
+    except Exception:
+        pass
+
+    # Local overlay: a review spawned in a one-shot process would be killed
+    # with it (daemon thread) — defer instead of burning the counter. Always
+    # True off the ACP path; see agent/acp_nudge.may_fire.
+    try:
+        from agent.acp_nudge import may_fire as _acp_nudge_may_fire
+
+        _acp_nudge_can_review = _acp_nudge_may_fire(agent)
+    except Exception:
+        _acp_nudge_can_review = True
+
     # Check skill trigger NOW — based on how many tool iterations THIS turn used.
     _should_review_skills = False
     if (agent._skill_nudge_interval > 0
             and agent._iters_since_skill >= agent._skill_nudge_interval
-            and "skill_manage" in agent.valid_tool_names):
+            and "skill_manage" in agent.valid_tool_names
+            and _acp_nudge_can_review):
         _should_review_skills = True
         agent._iters_since_skill = 0
+        try:
+            from agent.acp_nudge import note_reset as _acp_nudge_note_reset
+
+            _acp_nudge_note_reset(agent)
+        except Exception:
+            pass
 
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(

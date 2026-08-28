@@ -67,3 +67,52 @@ class TestExtraBodyResolution:
             base_url=BASE, custom_providers=[entry],
         )
         assert got is None
+
+
+class TestNamedProviderKeySpelling:
+    """A keyed ``providers:`` entry is addressable by its bare config key.
+
+    August 2026 incident: ``model.provider: magnit-gpt`` (the spelling
+    config.yaml itself uses) resolved to None, so the entry's
+    ``extra_body: {drop_params: true}`` never reached the litellm endpoint
+    and every turn 400'd on ``reasoning_effort`` before silently falling
+    back to another provider.
+    """
+
+    def _keyed(self):
+        return _entry(
+            provider_key="magnit-gpt",
+            name="magnit-gpt",
+            model="magnit-gpt-fast",
+            models={"MagnitGPT": {}, "magnit-gpt-fast": {}},
+            extra_body={"drop_params": True},
+        )
+
+    def test_bare_config_key_resolves(self):
+        got = _custom_provider_extra_body_for_agent(
+            provider="magnit-gpt", model="MagnitGPT",
+            base_url=BASE, custom_providers=[self._keyed()],
+        )
+        assert got == {"drop_params": True}
+
+    def test_canonical_slug_still_resolves(self):
+        got = _custom_provider_extra_body_for_agent(
+            provider="custom:magnit-gpt", model="MagnitGPT",
+            base_url=BASE, custom_providers=[self._keyed()],
+        )
+        assert got == {"drop_params": True}
+
+    def test_bare_key_on_a_different_route_is_not_applied(self):
+        got = _custom_provider_extra_body_for_agent(
+            provider="magnit-gpt", model="MagnitGPT",
+            base_url="https://elsewhere.example/v1",
+            custom_providers=[self._keyed()],
+        )
+        assert got is None
+
+    def test_empty_provider_resolves_nothing(self):
+        got = _custom_provider_extra_body_for_agent(
+            provider="", model="MagnitGPT",
+            base_url=BASE, custom_providers=[self._keyed()],
+        )
+        assert got is None

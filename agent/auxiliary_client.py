@@ -5982,7 +5982,13 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     try:
         from agent.copilot_acp_client import CopilotACPClient
         if isinstance(sync_client, CopilotACPClient):
-            return sync_client, model
+            # Local overlay: upstream returned the SYNC client here, so every
+            # awaiting caller (async_call_llm → vision pre-analysis) crashed
+            # with "SimpleNamespace can't be used in 'await' expression".
+            # Rationale and the thread hand-off: agent/acp_async_client.
+            from agent.acp_async_client import AsyncCopilotACPClient
+
+            return AsyncCopilotACPClient(sync_client), model
     except ImportError:
         pass
 

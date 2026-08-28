@@ -1286,13 +1286,22 @@ def is_container() -> bool:
         pass
     # cgroup v2: /proc/1/cgroup is just "0::/" with no marker. The container
     # runtime still shows up in the mount table (overlay rootfs, runtime mount
-    # paths), so scan mountinfo as a last resort.
+    # paths), so scan mountinfo as a last resort. Only the root ("/") mount
+    # entry counts: a HOST that merely runs Docker/containerd sees the runtime's
+    # snapshot paths on other mount points too, and matching anywhere in
+    # mountinfo false-positives on such hosts (their gateway then wrongly
+    # switches subprocess HOME to the profile home).
     try:
         with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
-            mountinfo = f.read()
-            if any(marker in mountinfo for marker in ("kubepods", "containerd", "crio")):
-                _container_detected = True
-                return True
+            for line in f:
+                fields = line.split()
+                # mountinfo(5): mount point is the 5th field; runtime markers
+                # (containerd/crio snapshot dirs) appear in the overlay
+                # lowerdir/upperdir super-options on the same line.
+                if len(fields) > 4 and fields[4] == "/":
+                    if any(marker in line for marker in ("kubepods", "containerd", "crio")):
+                        _container_detected = True
+                        return True
     except OSError:
         pass
     _container_detected = False

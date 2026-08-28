@@ -414,7 +414,12 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "moa": "Mixture of Agents",
     "nous": "Nous Portal",
     "openai-codex": "ChatGPT or Codex Subscription",
-    "copilot-acp": "GitHub Copilot ACP",
+    # The slug says "copilot", but the ACP command is configurable
+    # (HERMES_COPILOT_ACP_COMMAND) and on a Claude Code install it spawns
+    # claude-agent-acp, not copilot.  Label it after what the picker row
+    # offers (agent.acp_model_choice.ACP_PICKER_NAME) so the /model header
+    # and the button that leads there read the same.
+    "copilot-acp": "Claude (ACP bridge)",
     "stepfun": "StepFun Step Plan",
     "xiaomi": "Xiaomi MiMo",
     "gmi": "GMI Cloud",

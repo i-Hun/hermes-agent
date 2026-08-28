@@ -660,23 +660,65 @@ class GatewaySlashCommandsMixin:
                 context_used = _int_value(getattr(ctx, "last_prompt_tokens", 0))
                 context_total = _int_value(getattr(ctx, "context_length", 0))
 
-        model_name = model_name or _clean_str(session_row.get("model"))
-        provider_name = provider_name or _clean_str(session_row.get("billing_provider"))
-        base_url = base_url or _clean_str(session_row.get("billing_base_url"))
         context_used = context_used or _int_value(getattr(session_entry, "last_prompt_tokens", 0))
 
         user_config: dict[str, Any] = {}
-        if not model_name or not provider_name or not context_total:
+        try:
+            user_config = _load_gateway_config()
+        except Exception:
+            user_config = {}
+        config_model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
+        if not isinstance(config_model_cfg, dict):
+            config_model_cfg = {}
+
+        # Local overlay call-out: the `model` column of the sessions row records
+        # who answered LAST turn and decides nothing, so it must not outrank the
+        # session override / config that decide the NEXT one. Rationale and the
+        # 2026-08-10 /status-vs-/model split in gateway/status_model_truth.
+        last_turn_model = ""
+        try:
+            from gateway.status_model_truth import resolve as _status_model_resolve
+        except Exception:
+            _status_model_resolve = None
+        if _status_model_resolve is not None:
             try:
-                user_config = _load_gateway_config()
+                _override = self._session_model_overrides.get(session_key) or {}
             except Exception:
-                user_config = {}
+                _override = {}
+            if not _override:
+                try:
+                    _override = await self.async_session_store.get_model_override(session_key) or {}
+                except Exception:
+                    _override = {}
+            try:
+                _truth = _status_model_resolve(
+                    is_running=is_running,
+                    agent_model=model_name,
+                    agent_provider=provider_name,
+                    agent_base_url=base_url,
+                    override=_override,
+                    config_model=_resolve_gateway_model(user_config),
+                    config_provider=config_model_cfg.get("provider"),
+                    config_base_url=config_model_cfg.get("base_url"),
+                    db_model=session_row.get("model"),
+                    db_provider=session_row.get("billing_provider"),
+                    db_base_url=session_row.get("billing_base_url"),
+                )
+            except Exception:
+                logger.debug("status model truth failed", exc_info=True)
+            else:
+                model_name = _truth["model"]
+                provider_name = _truth["provider"]
+                base_url = _truth["base_url"]
+                last_turn_model = _truth["last_turn"]
+
+        model_name = model_name or _clean_str(session_row.get("model"))
+        provider_name = provider_name or _clean_str(session_row.get("billing_provider"))
+        base_url = base_url or _clean_str(session_row.get("billing_base_url"))
         if not model_name:
             model_name = _resolve_gateway_model(user_config)
         if not provider_name:
-            model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
-            if isinstance(model_cfg, dict):
-                provider_name = _clean_str(model_cfg.get("provider"))
+            provider_name = _clean_str(config_model_cfg.get("provider"))
         if not context_total:
             model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
             configured_context = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
@@ -715,6 +757,11 @@ class GatewaySlashCommandsMixin:
         ])
         if model_line:
             lines.append(model_line)
+        if last_turn_model:
+            # Only when it disagrees with the line above: the value is still
+            # worth having (it is the only record of who actually answered), it
+            # just is not the answer to "what model am I on".
+            lines.append(t("gateway.status.model_last_turn", model=last_turn_model))
         if context_line:
             lines.append(context_line)
         lines.extend([

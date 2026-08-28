@@ -438,6 +438,17 @@ def _custom_provider_extra_body_for_agent(
         provider_key_filter = ""
     elif provider_norm.startswith("custom:"):
         provider_key_filter = provider_norm.split(":", 1)[1].strip()
+    elif provider_norm:
+        # A keyed ``providers:`` entry is addressable by its bare config key
+        # (``model.provider: magnit-gpt``) as well as the canonical
+        # ``custom:magnit-gpt`` slug, and different route paths carry
+        # different spellings. Rejecting the bare form dropped the entry's
+        # ``extra_body`` — for a litellm endpoint that means ``drop_params``
+        # never reaches the wire and every turn 400s on ``reasoning_effort``
+        # before silently falling back to another provider.
+        # Non-custom providers (``copilot-acp``, ``anthropic``, …) match no
+        # entry key and still resolve to None below.
+        provider_key_filter = provider_norm
     else:
         return None
 
@@ -471,23 +482,73 @@ def _custom_provider_extra_body_for_agent(
     return fallback
 
 
-def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, Any]]) -> None:
-    extra_body = _custom_provider_extra_body_for_agent(
+def apply_custom_provider_extra_body(agent, custom_providers: List[Dict[str, Any]]) -> None:
+    """(Re)apply the matching custom provider's ``extra_body`` to the agent.
+
+    Must run on every route change — init, ``/model`` switch, fallback
+    activation, primary-runtime restore — not just at init: the entry that
+    matches is keyed on (provider, model, base_url), so a merge done once at
+    startup leaves a re-routed session sending the *previous* endpoint's body,
+    or none at all.  A session that starts on Anthropic and is later switched
+    to a litellm-backed OpenAI-compatible endpoint was the concrete failure:
+    the endpoint 400s on ``reasoning_effort`` unless ``drop_params: true``
+    rides along, the configured ``extra_body`` never reached the wire after
+    the switch, and every turn silently fell back to the previous provider.
+
+    Re-application is idempotent: the caller-supplied ``extra_body`` is
+    snapshotted on first use, so the previous endpoint's keys are dropped
+    rather than leaked onto the next one (``drop_params`` must not follow the
+    route back to Anthropic).
+    """
+    overrides = dict(getattr(agent, "request_overrides", {}) or {})
+
+    if not hasattr(agent, "_user_request_extra_body"):
+        _user_body = overrides.get("extra_body")
+        agent._user_request_extra_body = (
+            dict(_user_body) if isinstance(_user_body, dict) else {}
+        )
+
+    provider_extra_body = _custom_provider_extra_body_for_agent(
         provider=agent.provider,
         model=agent.model,
         base_url=agent.base_url,
         custom_providers=custom_providers,
-    )
-    if not extra_body:
-        return
+    ) or {}
 
-    overrides = dict(getattr(agent, "request_overrides", {}) or {})
-    merged_extra_body = dict(extra_body)
-    existing_extra_body = overrides.get("extra_body")
-    if isinstance(existing_extra_body, dict):
-        merged_extra_body.update(existing_extra_body)
-    overrides["extra_body"] = merged_extra_body
+    # User-supplied keys win over the provider entry's, as before.
+    merged_extra_body = dict(provider_extra_body)
+    merged_extra_body.update(agent._user_request_extra_body)
+
+    if merged_extra_body:
+        overrides["extra_body"] = merged_extra_body
+    else:
+        overrides.pop("extra_body", None)
     agent.request_overrides = overrides
+
+
+def reapply_custom_provider_extra_body(agent) -> None:
+    """Route-change hook — re-run the merge against the live provider list.
+
+    Reads the config fresh so an ``extra_body`` added after session start is
+    honored by a mid-session switch, and falls back to the init-time snapshot
+    when the config read fails (stale list still beats a stale merge).
+    """
+    custom_providers = None
+    try:
+        from hermes_cli.config import (
+            get_compatible_custom_providers,
+            load_config_readonly,
+        )
+
+        custom_providers = get_compatible_custom_providers(load_config_readonly())
+    except Exception:
+        custom_providers = None
+    if custom_providers is None:
+        custom_providers = getattr(agent, "_custom_providers", None) or []
+    try:
+        apply_custom_provider_extra_body(agent, custom_providers)
+    except Exception:
+        logger.debug("custom-provider extra_body re-application failed", exc_info=True)
 
 
 def init_agent(
@@ -2424,7 +2485,7 @@ def init_agent(
     # Store for reuse by _check_compression_model_feasibility (auxiliary
     # compression model context-length detection needs the same list).
     agent._custom_providers = _custom_providers
-    _merge_custom_provider_extra_body(agent, _custom_providers)
+    apply_custom_provider_extra_body(agent, _custom_providers)
 
     # Check custom_providers per-model context_length
     if _config_context_length is None and _custom_providers:

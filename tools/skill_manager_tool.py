@@ -513,6 +513,16 @@ def _curator_consolidation_delete_guard(
 MAX_SKILL_CONTENT_CHARS = 100_000   # ~36k tokens at 2.75 chars/token
 MAX_SKILL_FILE_BYTES = 1_048_576    # 1 MiB per supporting file
 
+# Soft ceiling for SKILL.md only. The hard limit above is a backstop against
+# pathological writes; in practice a SKILL.md is read end-to-end on every
+# skill_view, so ~25k chars (~9k tokens) is where it stops being a router and
+# starts being a document. Exceeding this does NOT block the write — it returns
+# an advisory alongside the success result so the growth is noticed at write
+# time instead of during a manual audit months later. Supporting files under
+# references/ are the intended destination for offloaded prose and are never
+# warned about.
+SKILL_MD_WARN_CHARS = 25_000
+
 # Characters allowed in skill names (filesystem-safe, URL-friendly)
 VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
 
@@ -633,6 +643,32 @@ def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[st
             f"in references/ or templates/."
         )
     return None
+
+
+def _skill_md_size_warning(content: str) -> Optional[str]:
+    """Advisory for a SKILL.md that is over the soft ceiling but under the hard one.
+
+    Returns a message to attach to a *successful* write, or None. Never blocks.
+    """
+    size = len(content)
+    if size <= SKILL_MD_WARN_CHARS or size > MAX_SKILL_CONTENT_CHARS:
+        return None
+    return (
+        f"Size advisory: SKILL.md is now {size:,} characters "
+        f"(~{size // 4:,} tokens), over the {SKILL_MD_WARN_CHARS:,}-char soft "
+        f"ceiling. It is read in full on every skill_view. Consider moving "
+        f"detail (long examples, API dumps, tables) into references/ and "
+        f"leaving pointers behind — keep the routing signal in SKILL.md."
+    )
+
+
+def _attach_size_warning(result: Dict[str, Any], content: str) -> Dict[str, Any]:
+    """Attach the SKILL.md soft-ceiling advisory to a successful write result."""
+    warning = _skill_md_size_warning(content)
+    if warning:
+        result["size_warning"] = warning
+        result["message"] = f"{result['message']} {warning}"
+    return result
 
 
 def _resolve_skill_dir(name: str, category: str = None) -> Path:
@@ -972,6 +1008,7 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     )
     _add_description_prompt_preview(result, content)
     _attach_lint_findings(result, skill_md)
+    _attach_size_warning(result, content)
     return result
 
 
@@ -1062,6 +1099,7 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
         result["org_sharing"] = org_note
         result["message"] = f"{result['message']} {org_note}"
     _add_description_prompt_preview(result, content)
+    _attach_size_warning(result, content)
     return result
 
 
@@ -1182,6 +1220,8 @@ def _patch_skill(
     if org_note:
         result["org_sharing"] = org_note
         result["message"] = f"{result['message']} {org_note}"
+    if not file_path:
+        _attach_size_warning(result, new_content)
     return result
 
 

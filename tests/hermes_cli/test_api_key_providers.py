@@ -30,7 +30,7 @@ class TestProviderRegistry:
     """Test that new providers are correctly registered."""
 
     @pytest.mark.parametrize("provider_id,name,auth_type", [
-        ("copilot-acp", "GitHub Copilot ACP", "external_process"),
+        ("copilot-acp", "Claude (ACP bridge)", "external_process"),
         ("copilot", "GitHub Copilot", "api_key"),
         ("huggingface", "Hugging Face", "api_key"),
         ("zai", "Z.AI / GLM", "api_key"),

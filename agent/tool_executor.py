@@ -606,6 +606,15 @@ def _run_agent_tool_execution_middleware(
             agent._turns_since_memory = 0
         elif function_name == "skill_manage":
             agent._iters_since_skill = 0
+            # The ACP path keeps this counter on disk (agent/acp_nudge.py), so
+            # the reset has to reach disk too — otherwise the durable total
+            # outlives the very use that was supposed to clear it.
+            try:
+                from agent.acp_nudge import note_reset as _acp_nudge_note_reset
+
+                _acp_nudge_note_reset(agent)
+            except Exception:
+                pass
 
         _advance_start_order(_begin)
         return execute(final_args)

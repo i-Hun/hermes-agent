@@ -1201,6 +1201,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "prefetch_waits_for_retain", "description": "Have the background next-turn prefetch wait for the just-completed retain to become recall-visible on the server (local queue drain + async operation completion) before recalling, so recall includes the just-completed turn (runs off the reply path, adds no response latency)", "default": True},
             {"key": "prefetch_retain_drain_timeout", "description": "Max seconds the background prefetch waits for the retain to become recall-visible (queue drain + server-side completion) before recalling anyway", "default": 10.0},
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
+            {"key": "retain_context_cron", "description": "Context label used instead of retain_context on scheduled (cron) runs, where the first message is job text rather than a human turn. Blank = use retain_context.", "default": ""},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
@@ -1697,6 +1698,16 @@ class HindsightMemoryProvider(MemoryProvider):
         self._auto_retain = self._config.get("auto_retain", True)
         self._retain_every_n_turns = max(1, int(self._config.get("retain_every_n_turns", 1)))
         self._retain_context = self._config.get("retain_context", "conversation between Hermes Agent and the User")
+        # A scheduled run has no human turn: the first message is job text from
+        # the cron table, not something the user just said. Extracting it under
+        # the interactive retain_context ("two participants: the user and the
+        # assistant") credits the user with intentions they never expressed in
+        # this log. Profiles may supply `retain_context_cron`; without the key
+        # behaviour is unchanged.
+        if self._platform == "cron":
+            self._retain_context = (
+                self._config.get("retain_context_cron") or self._retain_context
+            )
 
         # Recall controls
         self._auto_recall = self._config.get("auto_recall", True)

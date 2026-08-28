@@ -20,9 +20,45 @@ from typing import Any, Callable, Optional
 
 from agent.i18n import t
 
+try:  # overlay: boundary-aware handoff excerpts for kanban pings
+    from hermes_cli.kanban_handoff import handoff_excerpt
+except Exception:  # pragma: no cover - overlay absent, keep upstream behaviour
+
+    def handoff_excerpt(text: object, limit: int | None = None) -> str:
+        lines = str(text or "").strip().splitlines()
+        return lines[0][: (limit or 200)] if lines else ""
+
+
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+
+def describe_timed_out(payload: Optional[dict]) -> str:
+    """Render the cause of a ``timed_out`` event, not a guess at it.
+
+    Two independent paths emit ``timed_out``: ``enforce_max_runtime``
+    (wall-clock limit, payload carries ``limit_seconds``) and the agent's
+    iteration-budget exit in ``agent/turn_finalizer.py`` (payload carries
+    ``budget_used``/``budget_max``). Notifiers used to assume the first and
+    default a missing limit to 0, so a budget exhaustion was announced as
+    "max_runtime=0s" — a limit no one had configured, sending the reader
+    after a config bug that does not exist.
+    """
+    payload = payload or {}
+    limit = payload.get("limit_seconds")
+    if limit:
+        try:
+            return f"max_runtime={int(limit)}s"
+        except (TypeError, ValueError):
+            pass
+    used, budget_max = payload.get("budget_used"), payload.get("budget_max")
+    if used and budget_max:
+        return f"iteration budget {used}/{budget_max}"
+    error = handoff_excerpt(payload.get("error"), 160)
+    if error:
+        return error
+    return "cause not recorded"
 
 
 def _resolve_auto_decompose_settings(
@@ -542,13 +578,11 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("summary"):
                                 payload_summary = str(ev.payload["summary"])
                             if payload_summary:
-                                lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
+                                h = handoff_excerpt(payload_summary)
                                 handoff = f"\n{h}"
                                 wake_handoff = h
                             elif task and task.result:
-                                lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
+                                r = handoff_excerpt(task.result)
                                 handoff = f"\n{r}"
                                 wake_handoff = r
                             msg = (
@@ -558,12 +592,12 @@ class GatewayKanbanWatchersMixin:
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
+                                reason = f": {handoff_excerpt(ev.payload['reason'])}"
                             msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
+                                err = f"\n{handoff_excerpt(ev.payload['error'])}"
                             msg = (
                                 f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
                                 f"after repeated spawn failures{err}"
@@ -574,12 +608,9 @@ class GatewayKanbanWatchersMixin:
                                 f"(pid gone); dispatcher will retry"
                             )
                         elif kind == "timed_out":
-                            limit = 0
-                            if ev.payload and ev.payload.get("limit_seconds"):
-                                limit = int(ev.payload["limit_seconds"])
                             msg = (
                                 f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
+                                f"({describe_timed_out(ev.payload)}); will retry"
                             )
                         elif kind == "status":
                             new_status = ""
@@ -591,7 +622,7 @@ class GatewayKanbanWatchersMixin:
                             # first-class review lane. Wake the origin thread.
                             handoff = ""
                             if ev.payload and ev.payload.get("summary"):
-                                handoff = f"\n{str(ev.payload['summary'])[:200]}"
+                                handoff = f"\n{handoff_excerpt(ev.payload['summary'])}"
                             msg = (
                                 f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
                                 f" — {title}{handoff}"
@@ -608,7 +639,7 @@ class GatewayKanbanWatchersMixin:
                             recurrences = None
                             if ev.payload:
                                 if ev.payload.get("reason"):
-                                    reason = f": {str(ev.payload['reason'])[:160]}"
+                                    reason = f": {handoff_excerpt(ev.payload['reason'])}"
                                 recurrences = ev.payload.get("recurrences")
                             rc = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
                             msg = (

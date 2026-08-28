@@ -704,6 +704,17 @@ def direct_api_call(agent, api_kwargs: dict):
                 _bump_stale_streak(agent)
             request_client = request_state["client"]
             if request_client is not None:
+                # Overlay: record the close for ACP failover accounting. Its
+                # OWN try — a bookkeeping failure must never cost us the abort
+                # that follows.
+                try:
+                    from agent.acp_failover import note_request_close
+
+                    note_request_close(agent, request_client, reason)
+                except Exception:
+                    logger.debug(
+                        "note_request_close failed (%s)", reason, exc_info=True
+                    )
                 try:
                     agent._abort_request_openai_client(request_client, reason=reason)
                 except Exception:
@@ -946,6 +957,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
             request_client_holder["owner_tid"] = None
         if request_client is None:
             return
+        # Local overlay: the abort helpers below shut down *sockets*, and an
+        # ACP client has none — an interrupt left the engine generating and
+        # left no trace that the kill was ours. Stamp the client and stop its
+        # bridge here, at the event. See agent/acp_failover.note_request_close.
+        from agent.acp_failover import note_request_close
+
+        note_request_close(agent, request_client, reason)
         if request_client_kind.get("value", "openai") == "anthropic_messages":
             agent._close_request_anthropic_client(request_client, reason=reason)
         else:
@@ -1257,9 +1275,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
             break
 
-        # Stale-call detector: kill the connection if no response
-        # arrives within the configured timeout.
-        if _elapsed > _stale_timeout:
+        # Stale-call detector: kill the connection if no response arrives
+        # within the configured timeout. Providers that report engine activity
+        # (ACP) are judged on IDLE time instead of total time — see
+        # agent/acp_stale.py.
+        from agent.acp_stale import should_kill_stale
+
+        if should_kill_stale(agent, _elapsed, _stale_timeout):
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
             if callable(_hint_fn):
@@ -2152,6 +2174,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             agent._transport_cache.clear()
         agent._fallback_activated = True
 
+        # The fallback route is a different endpoint: re-merge its custom
+        # provider ``extra_body`` and drop the primary's, so per-endpoint
+        # request quirks (e.g. litellm's ``drop_params``) follow the route.
+        from agent.agent_init import reapply_custom_provider_extra_body
+        reapply_custom_provider_extra_body(agent)
+
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
         # recovery (rate_limit / billing / auth) mutate the wrong credential
@@ -2366,6 +2394,27 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             defer_logical_completion=True,
         )
 
+    def _safe_normalize_response(transport, response, **kwargs):
+        """Wrap normalize_response so a malformed adapter response doesn't crash the summary path."""
+        try:
+            return transport.normalize_response(response, **kwargs)
+        except (AttributeError, TypeError, IndexError) as e:
+            logger.warning(
+                "Summary path: normalize_response failed (response_type=%s, error=%s). "
+                "Falling back to retry or default message.",
+                type(response).__name__ if response is not None else "None",
+                e,
+            )
+            from agent.transports.types import NormalizedResponse
+            return NormalizedResponse(
+                content=None,
+                tool_calls=None,
+                finish_reason="error",
+                reasoning=None,
+                usage=None,
+                provider_data=None,
+            )
+
     # Shared constant so compaction recognizers can identify this runtime nudge
     # by its stable content after SessionDB projection strips metadata flags
     # (see MAX_ITERATIONS_SUMMARY_REQUEST / _is_synthetic_compression_user_turn).
@@ -2493,7 +2542,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             codex_kwargs.pop("tools", None)
             summary_response = agent._run_codex_stream(codex_kwargs)
             _ct_sum = agent._get_transport()
-            _cnr_sum = _ct_sum.normalize_response(summary_response)
+            _cnr_sum = _safe_normalize_response(_ct_sum, summary_response)
             final_response = (_cnr_sum.content or "").strip()
         else:
             summary_kwargs = {
@@ -2576,7 +2625,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     agent._anthropic_messages_create,
                     retry_count=0,
                 )
-                _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
+                _summary_result = _safe_normalize_response(_tsum, summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
             else:
                 summary_client = agent._ensure_primary_openai_client(
@@ -2587,7 +2636,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     lambda request: summary_client.chat.completions.create(**request),
                     retry_count=0,
                 )
-                _summary_result = agent._get_transport().normalize_response(summary_response)
+                _summary_result = _safe_normalize_response(agent._get_transport(), summary_response)
                 final_response = (_summary_result.content or "").strip()
 
         if final_response:
@@ -2605,7 +2654,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 codex_kwargs.pop("tools", None)
                 retry_response = agent._run_codex_stream(codex_kwargs)
                 _ct_retry = agent._get_transport()
-                _cnr_retry = _ct_retry.normalize_response(retry_response)
+                _cnr_retry = _safe_normalize_response(_ct_retry, retry_response)
                 final_response = (_cnr_retry.content or "").strip()
             elif agent.api_mode == "anthropic_messages":
                 _tretry = agent._get_transport()
@@ -2625,7 +2674,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     agent._anthropic_messages_create,
                     retry_count=1,
                 )
-                _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
+                _retry_result = _safe_normalize_response(_tretry, retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_retry_result.content or "").strip()
             else:
                 summary_kwargs = {
@@ -2649,7 +2698,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     lambda request: summary_client.chat.completions.create(**request),
                     retry_count=1,
                 )
-                _retry_result = agent._get_transport().normalize_response(summary_response)
+                _retry_result = _safe_normalize_response(agent._get_transport(), summary_response)
                 final_response = (_retry_result.content or "").strip()
 
             if final_response:
@@ -3188,6 +3237,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             return
         # Stranger threads returned under the lock above, so only the owner
         # (or an any-thread-safe stream handle) reaches the close dispatch.
+        #
+        # See the non-streaming variant: ACP clients need their bridge killed
+        # and the deliberate cancel recorded on the object that dies with the
+        # call. A registered stream handle has no abort_for_interrupt and is
+        # skipped.
+        from agent.acp_failover import note_request_close
+
+        note_request_close(agent, request_client, reason)
         if request_kind == "stream":
             _close_request_stream_handle(request_client, reason)
         elif request_kind == "anthropic_messages":

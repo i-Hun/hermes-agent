@@ -326,6 +326,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     last_activity:         "**Gníomhaíocht is déanaí:** {timestamp}"
     model:                 "**Model:** `{model}`"
     model_provider:        "**Model:** `{model}` ({provider})"
+    model_last_turn:       "**D'fhreagair an seal deireanach le:** `{model}`"
     context:               "**Context:** {used} / {total} ({pct}%)"
     context_used:          "**Context:** ~{used} tokens"
     tokens:                "**Lifetime tokens billed:** {tokens} _(not your current context size; use `/context`)_"

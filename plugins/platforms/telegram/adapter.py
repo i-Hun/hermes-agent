@@ -646,6 +646,7 @@ class TelegramAdapter(BasePlatformAdapter):
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
     supports_code_blocks = True  # Telegram MarkdownV2 renders fenced code blocks
+    supports_expandable_quote = True  # MarkdownV2 "**> …||" collapsed blockquotes
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     # Bot API 10.1 Rich Messages cap the raw markdown/html text at 32,768
     # UTF-8 characters. Content above this is sent via the legacy chunking path.
@@ -5253,6 +5254,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 # "Message is not modified" is a no-op, not an error
                 if "not modified" in str(fmt_err).lower():
                     return SendResult(success=True, message_id=message_id)
+                # A rate limit is not a formatting problem. Retrying as plain
+                # text neither helps nor is free: it spends a second request
+                # out of the very budget that is exhausted (deepening the
+                # penalty) and downgrades a good bubble to unformatted text.
+                # Hand it to the outer handler, which knows how to back off.
+                # Classification helper: gateway/progress_flood (overlay).
+                from gateway.progress_flood import is_flood_error
+
+                if is_flood_error(fmt_err):
+                    raise
                 # Fallback: strip MarkdownV2 escapes and retry as clean plain text
                 safe_format_error = _redact_telegram_error_text(fmt_err)
                 logger.warning(
@@ -6237,6 +6248,18 @@ class TelegramAdapter(BasePlatformAdapter):
             from hermes_cli.models import group_providers
         except Exception:
             group_providers = None
+
+        # Local overlay call-out: on this install copilot-acp does not run
+        # Copilot, it runs claude-agent-acp — so folding it into the GitHub
+        # Copilot family buries the fleet's own models behind the wrong vendor's
+        # name. Rationale in agent/acp_model_choice.ungrouped_fold.
+        if group_providers is not None:
+            try:
+                from agent.acp_model_choice import ungrouped_fold as _acp_fold
+
+                group_providers = _acp_fold(group_providers, providers)
+            except Exception:
+                pass
 
         by_slug = {p.get("slug"): p for p in providers}
 
@@ -8085,21 +8108,34 @@ class TelegramAdapter(BasePlatformAdapter):
         # 9) Convert blockquotes: > at line start → protect > from escaping
         #    Handle both regular blockquotes (> text) and expandable blockquotes
         #    (Telegram MarkdownV2: **> for expandable start, || to end the quote)
-        def _convert_blockquote(m):
-            prefix = m.group(1)  # >, >>, >>>, **>, or **>> etc.
-            content = m.group(2)
-            # Check if content ends with || (expandable blockquote end marker)
-            # In this case, preserve the trailing || unescaped for Telegram
-            if prefix.startswith('**') and content.endswith('||'):
-                return _ph(f'{prefix} {_escape_mdv2(content[:-2])}||')
-            return _ph(f'{prefix} {_escape_mdv2(content)}')
-
-        text = re.sub(
-            r'^((?:\*\*)?>{1,3}) (.+)$',
-            _convert_blockquote,
-            text,
-            flags=re.MULTILINE,
-        )
+        # Quote lines are converted with block context: the || expandable
+        # terminator is only meaningful inside a quote opened with **>, and
+        # it may sit on a plain-">" continuation line of that quote.  In a
+        # regular quote (opened with bare >) a trailing || is literal text
+        # and must be escaped.
+        # The space after the marker is optional and is CARRIED THROUGH
+        # verbatim: Telegram treats everything after ">" as quote content, so
+        # "> x" renders as an indented " x" on every line but the first (the
+        # first loses it to the Bot API's message-level whitespace trim).
+        # Producers that want a flush quote emit ">x"; keeping the separator
+        # in a group means "> x" still round-trips exactly as before.
+        _quote_line_re = re.compile(r'^((?:\*\*)?>{1,3})( ?)(.+)$')
+        _bq_lines = text.split('\n')
+        _in_expandable = False
+        for _i, _bq_line in enumerate(_bq_lines):
+            _m = _quote_line_re.match(_bq_line)
+            if not _m:
+                _in_expandable = False
+                continue
+            _prefix, _sep, _content = _m.group(1), _m.group(2), _m.group(3)
+            if _prefix.startswith('**'):
+                _in_expandable = True
+            if _in_expandable and _content.endswith('||'):
+                _bq_lines[_i] = _ph(f'{_prefix}{_sep}{_escape_mdv2(_content[:-2])}||')
+                _in_expandable = False  # || closes the expandable quote
+            else:
+                _bq_lines[_i] = _ph(f'{_prefix}{_sep}{_escape_mdv2(_content)}')
+        text = '\n'.join(_bq_lines)
 
         # 10) Escape remaining special characters in plain text
         text = _escape_mdv2(text)
@@ -10178,12 +10214,21 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
+        # Local overlay: mark events built from an EDITED message so the
+        # gateway can replace the queued copy instead of adding a second turn
+        # (agent/telegram_message_edits.py). PTB routes edited_message through
+        # the same MessageHandler, so without this flag an edit is inbound #2.
+        _edit_metadata = (
+            {"telegram_edited": True} if getattr(message, "edit_date", None) else {}
+        )
+
         return MessageEvent(
             text=message.text or "",
             message_type=msg_type,
             source=source,
             raw_message=message,
             message_id=str(message.message_id),
+            metadata=_edit_metadata,
             platform_update_id=update_id,
             reply_to_message_id=reply_to_id,
             reply_to_text=reply_to_text,

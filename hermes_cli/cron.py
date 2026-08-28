@@ -208,7 +208,16 @@ def cron_tick():
 
 def cron_runs(job_id: Optional[str] = None, limit: int = 20):
     """Show indexed durable cron execution history."""
-    from cron.executions import list_executions
+    from cron.executions import list_executions, recover_interrupted_executions
+
+    # Reconcile before reading: an attempt whose owner was killed (interrupted
+    # `hermes cron run`, gateway restart mid-run) stays `running` in the ledger
+    # until something recovers it, and history is exactly where a human goes to
+    # find out. Liveness-proven, so a genuinely in-flight attempt is untouched.
+    try:
+        recover_interrupted_executions()
+    except Exception:
+        pass  # never let audit hygiene break the listing itself
 
     records = list_executions(job_id=job_id, limit=limit)
     if not records:

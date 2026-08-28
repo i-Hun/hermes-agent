@@ -19,10 +19,17 @@ def isolated_kanban_home(monkeypatch):
     """Spin up a fresh HERMES_HOME with a clean kanban DB."""
     test_home = tempfile.mkdtemp(prefix="kanban_default_assignee_test_")
     monkeypatch.setenv("HERMES_HOME", test_home)
-    # Force-reimport so the fresh HERMES_HOME is picked up.
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
+    # NB: no ``del sys.modules["hermes_cli*"]`` force-reimport here. Every
+    # path this fixture cares about (``kanban_home`` →
+    # ``get_default_hermes_root``) reads ``HERMES_HOME`` at CALL time, so
+    # the setenv above is already enough. Wiping the modules instead split
+    # module identity for the rest of the process: test modules that bound
+    # ``hermes_cli.*`` at collection kept the old objects while lazy
+    # in-function imports (e.g. ``kanban_db`` → ``hermes_cli.lifecycle`` →
+    # ``hermes_cli.plugins``) pulled fresh ones, so autouse guards and
+    # plugin-manager singletons patched by later tests were no longer the
+    # ones under test — 15 order-dependent failures in
+    # ``pytest tests/hermes_cli -k kanban``.
     from hermes_cli import kanban_db
     yield kanban_db, test_home
     # Cleanup is best-effort; tempfile dir survives but pytest isolation

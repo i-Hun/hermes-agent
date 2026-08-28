@@ -536,7 +536,12 @@ CURATOR_REVIEW_PROMPT = (
     "guessing from your YAML summary after the fact is fragile.\n"
     "  - terminal                       — move LOCAL candidate content into "
     "a support subfile when package integrity requires it; never mv, cp, rm, "
-    "patch, or rewrite bundled, hub-installed, or external-dir skills\n\n"
+    "patch, or rewrite bundled, hub-installed, or external-dir skills\n"
+    "    ENFORCED by the gateway permission guard: shell deletes/renames of "
+    "skill content, writes outside references/ templates/ scripts/ assets/, "
+    "and anything touching .archive/ are DENIED. Archiving happens ONLY via "
+    "skill_manage action=delete — do not retry a denied shell command, use "
+    "the tool.\n\n"
     "'keep' is a legitimate decision ONLY when the skill is already a "
     "class-level umbrella and none of the proposed merges would improve "
     "discoverability. 'This is narrow but distinct from its siblings' "
@@ -1981,6 +1986,26 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
                 if isinstance(args_raw, str) and len(args_raw) > 400:
                     args_raw = args_raw[:400] + "…"
                 _calls.append({"name": name, "arguments": args_raw})
+
+        # Native ACP path: tool calls run inside the engine (MCP bridge) and
+        # never appear in _session_messages — run.json showed tool_calls: []
+        # for the 2026-07-21 consolidation even though the model made dozens
+        # of calls. The ACP client records every tool_call session/update on
+        # itself; merge those so the report and the absorbed_into /
+        # consolidation-classification heuristics see the real activity.
+        # Native ACP path: the engine runs tools inside itself, so they never
+        # appear in _session_messages. The ledger lives in the overlay module
+        # (which also knows where it is actually recorded — see the note there
+        # about per-request clients being discarded).
+        from agent.acp_native_calls import native_calls_for_report
+
+        _native_calls = native_calls_for_report(review_agent)
+        for _entry in _native_calls:
+            if isinstance(_entry, dict) and _entry.get("name"):
+                _calls.append({
+                    "name": str(_entry.get("name")),
+                    "arguments": _entry.get("arguments") or "",
+                })
         result_meta["tool_calls"] = _calls
     except Exception as e:
         result_meta["error"] = f"error: {e}"
