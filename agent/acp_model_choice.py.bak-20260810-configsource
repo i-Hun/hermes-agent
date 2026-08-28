@@ -1,0 +1,385 @@
+"""What ``/model`` means on a profile whose engine is the ACP bridge.
+
+Local overlay module (not upstream).
+
+Three things go wrong when the generic model switcher meets an ACP profile, and
+they are independent — fixing any two of them leaves ``/model`` broken:
+
+**1. The route.** ``claude-*`` is a name the catalog knows, so
+``model_switch.switch_model()`` resolves it to the ``anthropic`` provider at
+``https://api.anthropic.com`` and hands the session a direct-API client. On a
+subscription OAuth login that endpoint answers ``400 Third-party apps now draw
+from your extra usage, not your plan limits`` — measured 2026-08-09 17:39:51,
+three of them per turn, after which the turn slid back onto the bridge and
+answered on the *pinned* model. So the switch both failed and looked like it
+had worked. :func:`coerce_switch` keeps a ``claude-*`` target on the bridge.
+
+**2. The pin.** ``agent/acp_config`` is the single source for the engine model
+and it lives in ``.env``; ``model.default`` in ``config.yaml`` is only a label.
+A plain ``/model X`` persists the *label* — so without :func:`after_switch`
+moving the pin as well, a "saved globally" ack would be a lie.
+
+**3. The buttons.** Fixing 1 and 2 fixed the *typed* command only. The picker
+hands ``switch_model`` an ``explicit_provider`` on every press — that is how a
+row identifies itself — so :func:`coerce_switch` correctly stands aside and the
+press lands wherever the row said. Measured 2026-08-09 on the default profile:
+the picker offered ``moa``, ``copilot`` and ``anthropic``. There was no bridge
+row at all (the provider's curated model list is the placeholder
+``['copilot-acp']``, so the empty-row filter dropped it), and ``claude-opus-5``,
+the model most of the fleet runs on, was on no button anywhere. The only row
+leading to a claude model led to the direct API — the 400 again. There was no
+correct button to press. :func:`picker_rows` adds the bridge's own row and takes
+the ids it serves off the other rows, which is the payload-level dedup upstream
+already applies to routing aggregators (#45954), for the reason it states there:
+two buttons for one model, one of which silently breaks the call.
+
+The per-session case needs no writing at all: ``acp_config.explicit_choice``
+already reads "the agent's model differs from the profile's config label" as
+"someone chose this for this run", which is precisely what a ``--session``
+override produces.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+log = logging.getLogger(__name__)
+
+#: Provider slugs served by the ACP bridge rather than by an HTTP endpoint.
+ACP_PROVIDERS = frozenset({"copilot-acp"})
+
+
+def is_acp_provider(provider: Any) -> bool:
+    return str(provider or "").strip().lower() in ACP_PROVIDERS
+
+
+def _engine_model(value: Any) -> str | None:
+    """The bare engine name, or ``None``. Import-guarded: this module is a
+    call-out from an upstream file and must degrade to "do nothing"."""
+    try:
+        from agent.acp_config import normalize_model
+
+        return normalize_model(value)
+    except Exception:  # pragma: no cover - overlay import guard
+        return None
+
+
+def coerce_switch(
+    raw_input: Any, explicit_provider: Any, current_provider: Any
+) -> tuple[str, str]:
+    """``(provider_to_force, error)`` for one ``switch_model`` call.
+
+    Forces ``copilot-acp`` when an ACP profile is switching to an engine model
+    and the operator did not name a provider. An explicit ``--provider`` always
+    wins: leaving the bridge on purpose stays possible, it just has to be said.
+
+    Never raises and never invents an error — the empty tuple means "upstream
+    resolution is correct here", which is every non-ACP profile and every
+    non-``claude`` target.
+    """
+    if str(explicit_provider or "").strip():
+        return "", ""
+    if not is_acp_provider(current_provider):
+        return "", ""
+    if not _engine_model(raw_input):
+        return "", ""
+    return "copilot-acp", ""
+
+
+def after_switch(
+    *,
+    new_model: Any,
+    target_provider: Any,
+    current_provider: Any,
+    is_global: bool,
+    warnings: list[str] | None = None,
+    catalog_note: str = "",
+) -> list[str]:
+    """The ack's full warning list, and the ``.env`` pin move a global switch owes.
+
+    Takes the warnings upstream assembled and returns the list to show, because
+    one of them is wrong here: ``validate_requested_model`` checks the target
+    against *GitHub Copilot's* curated catalog, and the bridge is not Copilot —
+    it runs ``claude-agent-acp``. So ``/model claude-opus-5``, the model the
+    whole fleet runs on, came back "not found in the curated catalog … may still
+    work". A warning that fires on the healthy case is a warning people learn to
+    scroll past, so it is dropped for engine models on the ACP route (the real
+    validator there is ``acp_config._ENGINE_MODEL_RE``). Dropped by *equality*
+    with the message upstream computed, never by matching text.
+
+    Never raises: this runs inside ``switch_model``'s success path, and an
+    exception there would turn a completed switch into a reported failure. A pin
+    write that *fails* is reported loudly instead of swallowed — a silent
+    failure here is the whole bug class again ("saved globally" while the engine
+    keeps answering on the old model).
+    """
+    notes: list[str] = list(warnings or [])
+    if (
+        catalog_note
+        and catalog_note in notes
+        and is_acp_provider(target_provider)
+        and _engine_model(new_model)
+    ):
+        notes = [n for n in notes if n != catalog_note]
+    leaving = is_acp_provider(current_provider) and not is_acp_provider(target_provider)
+    if leaving:
+        notes.append(
+            "this profile runs on the ACP bridge — switching to "
+            f"{str(target_provider or '?')} leaves it, and the HERMES_ACP_MODEL "
+            "pin in .env no longer applies to this session"
+        )
+        return notes
+    if not is_acp_provider(target_provider):
+        return notes
+
+    if not is_global:
+        notes.append(
+            "ACP profile: this session only. The profile pin (HERMES_ACP_MODEL "
+            "in .env) is unchanged, and every other session keeps it"
+        )
+        return notes
+
+    try:
+        from agent.acp_config import (
+            FALLBACK_VAR,
+            MODEL_VAR,
+            dotenv_path,
+            normalize_model,
+            read_pins,
+            set_pins,
+        )
+
+        model = normalize_model(new_model)
+        if not model:
+            return notes
+        before = read_pins()
+        updates = {MODEL_VAR: model}
+        old_pin = before.get(MODEL_VAR, "")
+        fallback = before.get(FALLBACK_VAR, "")
+        # A fallback that tracked the primary keeps tracking it. One that names
+        # a *different* model was chosen deliberately (founder, 2026-08-02) and
+        # is not ours to retarget — but leaving it silently pointing at the
+        # model we just moved off is a downgrade nobody asked for, so say it.
+        if fallback and old_pin and fallback.casefold() == old_pin.casefold():
+            updates[FALLBACK_VAR] = model
+        after = set_pins(updates)
+        if after.get(MODEL_VAR, "").casefold() != model.casefold():
+            notes.append(
+                f"ACP profile: FAILED to move the engine pin in {dotenv_path()} — "
+                f"it still reads {after.get(MODEL_VAR) or '(unset)'!r}, so the "
+                "engine will keep answering on that. Fix it before relying on "
+                "this switch"
+            )
+            return notes
+        notes.append(
+            f"ACP profile: engine pin moved to {model} in .env — takes effect on "
+            "the next turn, no gateway restart needed"
+        )
+        if fallback and FALLBACK_VAR not in updates:
+            notes.append(
+                f"HERMES_ACP_FALLBACK_MODEL still names {fallback}: a failover "
+                "will answer on that, not on the model you just picked"
+            )
+    except Exception as exc:  # pragma: no cover - defensive, reported not hidden
+        log.warning("ACP pin move failed after model switch: %s", exc)
+        notes.append(
+            f"ACP profile: could not move the engine pin in .env ({exc}). "
+            "The label changed but the engine did not — treat this switch as "
+            "not applied"
+        )
+    return notes
+
+
+# --- the buttons -------------------------------------------------------------
+
+#: Slug and label of the virtual picker row for the bridge. The slug is not
+#: cosmetic: it is what a press hands back as ``explicit_provider``, so it has
+#: to be the provider slug ``switch_model`` resolves, not a display name.
+ACP_PICKER_SLUG = "copilot-acp"
+ACP_PICKER_NAME = "Claude (ACP bridge)"
+
+
+def _pinned_model() -> str | None:
+    try:
+        from agent.acp_config import MODEL_VAR, read_pins
+
+        return _engine_model(read_pins().get(MODEL_VAR))
+    except Exception:  # pragma: no cover - overlay import guard
+        return None
+
+
+def is_acp_profile(current_provider: Any = "") -> bool:
+    """Whether this *profile*'s engine is the bridge.
+
+    Deliberately not the same question as ``is_acp_provider(current_provider)``,
+    and the difference is the trap door: a session that already fell onto the
+    direct API reports ``anthropic`` as its current provider (the gateway reads
+    the session override before opening the picker), so asking only that would
+    withhold the bridge row from exactly the session that needs it to get back.
+    The pin is the profile-level fact — an ACP gateway refuses to start without
+    one — so a profile that declares a pin gets the row wherever this session
+    happens to be routed right now.
+    """
+    if is_acp_provider(current_provider):
+        return True
+    return bool(_pinned_model())
+
+
+def engine_models(current_model: Any = "") -> list[str]:
+    """The bridge's model ids: current, then pinned, then the known list.
+
+    Order is "what this profile actually runs" before "what exists", so the
+    first button is the one it is already on. Current and pinned are included
+    even when absent from ``KNOWN_ENGINE_MODELS``, because that tuple is a
+    display list and not a gate — a profile pinned to something newer than it
+    must not lose its own model from the picker.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        model = _engine_model(value)
+        if model and model.casefold() not in seen:
+            seen.add(model.casefold())
+            out.append(model)
+
+    add(current_model)
+    add(_pinned_model())
+    try:
+        from agent.acp_config import KNOWN_ENGINE_MODELS
+
+        for known in KNOWN_ENGINE_MODELS:
+            add(known)
+    except Exception:  # pragma: no cover - overlay import guard
+        pass
+    return out
+
+
+def picker_rows(
+    providers: Any,
+    *,
+    current_provider: Any = "",
+    current_model: Any = "",
+    max_models: Any = None,
+) -> Any:
+    """The ``/model`` picker payload for an ACP profile.
+
+    Two edits, and they are one idea: every engine model gets exactly one button,
+    and it is the one that works.
+
+    * the bridge gets a row, first, built from :func:`engine_models`;
+    * every other row loses the ids the bridge serves, matched by *exact* id.
+      Exact on purpose: OpenRouter carries ``anthropic/claude-opus-5``, a
+      genuinely different route that genuinely works, and it survives untouched
+      precisely because it is not the same id. A user's own configured endpoint
+      is skipped as well — upstream learned that one at #47077: the specific
+      provider is not a duplicate of anything, and gutting it empties its row.
+
+    Rows emptied by the dedup are dropped by ``list_picker_providers``' own
+    empty-row filter downstream; ``total_models`` follows upstream's aggregator
+    dedup and reports what is visible.
+
+    Never raises and returns the input unchanged on any doubt: a picker that
+    fails to open is worse than a picker missing a row.
+    """
+    try:
+        if not is_acp_profile(current_provider):
+            return providers
+        models = engine_models(current_model)
+        if not models:
+            return providers
+        try:
+            limit = int(max_models) if max_models is not None else None
+        except (TypeError, ValueError):
+            limit = None
+        row = {
+            "slug": ACP_PICKER_SLUG,
+            "name": ACP_PICKER_NAME,
+            "is_current": True,
+            "is_user_defined": False,
+            "models": models[:limit] if limit is not None else list(models),
+            "total_models": len(models),
+            "source": "virtual",
+            "authenticated": True,
+            "auth_type": "subscription",
+            "warning": (
+                "Runs through the local claude-agent-acp bridge on the "
+                "subscription login — not the direct Anthropic API."
+            ),
+        }
+        served = {m.casefold() for m in models}
+        rows = [row]
+        for provider in list(providers or []):
+            if not isinstance(provider, dict):
+                rows.append(provider)
+                continue
+            if str(provider.get("slug", "")).strip().lower() in ACP_PROVIDERS:
+                continue  # never two bridge rows
+            if provider.get("is_user_defined"):
+                rows.append(provider)
+                continue
+            original = list(provider.get("models") or [])
+            kept = [m for m in original if str(m).casefold() not in served]
+            if len(kept) != len(original):
+                provider = dict(provider)
+                provider["models"] = kept
+                provider["total_models"] = len(kept)
+            rows.append(provider)
+        return rows
+    except Exception as exc:  # pragma: no cover - defensive
+        log.debug("ACP picker row build failed: %s", exc)
+        return providers
+
+
+def ungrouped_fold(fold: Any, providers: Any) -> Any:
+    """Wrap ``group_providers`` so the bridge keeps its own top-level button.
+
+    Upstream folds ``copilot-acp`` into the GitHub Copilot family, and on a
+    stock install that is right — the slug means "the ``copilot --acp``
+    process". Here it does not: ``HERMES_COPILOT_ACP_COMMAND`` points the same
+    slot at ``claude-agent-acp``, which is the entire premise of this overlay.
+    Folded, the fleet's own models sit two taps deep behind a button naming the
+    wrong vendor, while the button that *reads* like the right one (Anthropic)
+    is the direct API. Adding a correct row and then hiding it is not a fix.
+
+    Returns ``fold`` untouched off an ACP profile, and degrades to it on any
+    error: a picker that raises here shows no keyboard at all.
+    """
+    try:
+        if not any(
+            isinstance(p, dict) and str(p.get("slug", "")).strip().lower() in ACP_PROVIDERS
+            for p in (providers or [])
+        ):
+            return fold
+    except Exception:  # pragma: no cover - defensive
+        return fold
+
+    def _fold(slugs: Any) -> Any:
+        rows = fold(slugs)
+        try:
+            out: list = []
+            promoted = False
+            for row in rows:
+                if row.get("kind") != "group":
+                    out.append(row)
+                    continue
+                members = [
+                    m for m in row.get("members", [])
+                    if str(m).strip().lower() not in ACP_PROVIDERS
+                ]
+                if len(members) == len(row.get("members", [])):
+                    out.append(row)
+                    continue
+                promoted = True
+                if len(members) == 1:
+                    out.append({"kind": "single", "slug": members[0]})
+                elif members:
+                    out.append(dict(row, members=members))
+            if not promoted:
+                return rows
+            return [{"kind": "single", "slug": ACP_PICKER_SLUG}] + out
+        except Exception:  # pragma: no cover - defensive
+            return rows
+
+    return _fold

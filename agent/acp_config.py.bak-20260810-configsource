@@ -1,0 +1,518 @@
+"""Single source of truth for the ACP bridge's env-driven configuration.
+
+Local overlay module (not upstream). Before this module the two values that
+decide *which engine answers* — ``HERMES_ACP_MODEL`` and the native-tools gate
+``HERMES_ACP_NATIVE_TOOLS`` — were resolved independently in three places:
+
+* ``agent/copilot_acp_client._acp_effective_model()`` — ``os.getenv`` with a
+  hardcoded ``claude-opus-4-8`` fallback;
+* ``claude-acp-run.sh`` — ``${HERMES_ACP_MODEL:-claude-opus-4-8}``, with its own
+  ``.env`` parse;
+* ``agent/auxiliary_client`` — resolves a model from config for utility calls
+  and never looks at ``HERMES_ACP_MODEL`` at all.
+
+They were kept in agreement by writing the value into BOTH a systemd drop-in and
+each profile's ``.env`` and remembering to keep them equal. That discipline
+failed silently twice (2026-07-25 … 07-28): three profiles carried the
+native-tools flag in ``.env`` but no model, so every CLI-path session resolved
+the hardcoded ``claude-opus-4-8`` while Hermes recorded ``requested_model:
+claude-opus-5``. Nothing "diverged" — one of the two values simply did not
+exist, and a guard that compares two values is blind to that.
+
+The fix has two halves, and both live here:
+
+1. **One source.** ``.env`` under ``HERMES_HOME`` is it. ``load_hermes_dotenv()``
+   (called at import by ``cli.py``, ``run_agent.py``, ``gateway/run.py``) copies
+   it into ``os.environ``, so the gateway needs no systemd ``Environment=``
+   duplicate — the drop-ins that carried one were removed with this change.
+2. **A resolution chain that cannot land on a stale constant by accident.**
+   ``resolve_model()`` falls back to the model Hermes actually asked for before
+   it falls back to the legacy default, so a missing value degrades to "what the
+   caller wanted" instead of to "whatever was hardcoded in 2026-07".
+
+``enforce()`` is the tripwire for re-introducing a second source, and its shape
+follows from one measured fact about the loader (verified 2026-07-28, and it is
+the opposite of what the old ``cron-health-guard`` alert assumed):
+``load_hermes_dotenv()`` applies ``HERMES_HOME/.env`` with ``override=True``, so
+``.env`` BEATS a systemd ``Environment=`` and a shell export. Consequences:
+
+* a value *conflict* cannot survive into a loaded process — ``.env`` has already
+  won. The conflict branch is kept for callers that inspect the files directly
+  (``bridge-doctor``) and as a cheap invariant, not as the working guard.
+* the failure that DOES survive is the quiet one: ``.env`` says nothing while
+  the process env carries a value. Nothing to override, so the gateway runs on
+  the drop-in's value and every CLI run of the same profile resolves something
+  else. That is exactly the 07-28 defect, and it is what a gateway now refuses
+  to start on.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+from pathlib import Path
+from typing import Any
+
+log = logging.getLogger(__name__)
+
+MODEL_VAR = "HERMES_ACP_MODEL"
+FALLBACK_VAR = "HERMES_ACP_FALLBACK_MODEL"
+NATIVE_VAR = "HERMES_ACP_NATIVE_TOOLS"
+#: The only two keys of ``.env`` this module will ever rewrite. Narrow on
+#: purpose: ``.env`` is a credential file (acp_permission_guard), and the way to
+#: let an agent move its own model without weakening that guard is to take the
+#: non-secret out from under it — not to open the file.
+MANAGED_VARS = (MODEL_VAR, FALLBACK_VAR)
+#: Escape hatch for a deliberate one-off ``HERMES_ACP_MODEL=… hermes -p x -z``:
+#: downgrades every divergence to a warning instead of a hard stop.
+OVERRIDE_VAR = "HERMES_ACP_ALLOW_ENV_OVERRIDE"
+
+#: Last-resort model, kept only so behaviour is defined when nothing is
+#: configured anywhere. Must stay equal to ``claude-acp-run.sh``'s own default.
+LEGACY_DEFAULT_MODEL = "claude-opus-4-8"
+
+#: Engine models the bridge is known to serve, most capable first. Two readers
+#: and one list on purpose: the ``/model`` picker builds its bridge row from it,
+#: and ``bridge-doctor``'s "nobody names a model that does not exist" check
+#: judges pins against it — those two disagreeing is how a typo becomes a button.
+#: Not a gate: ``_ENGINE_MODEL_RE`` decides what may be *run*, so a pin outside
+#: this tuple still works; being absent here only costs it a button and earns a
+#: doctor WARN.
+KNOWN_ENGINE_MODELS = (
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-fable-5",
+    "claude-opus-4-8",
+    "claude-haiku-4-5-20251001",
+)
+
+_TRUTHY = ("1", "true", "yes", "on")
+
+# Engine model names the bridge may be pointed at. Deliberately narrow: the aux
+# path hands us provider labels ("copilot-acp") as if they were models, and
+# spawning the engine with one of those is worse than falling back.
+_ENGINE_MODEL_RE = re.compile(r"^claude-[a-z0-9][a-z0-9._-]*$", re.IGNORECASE)
+
+# (path, mtime_ns, size) -> {var: value}; the gateway is long-lived and `.env`
+# is hot-reloadable, so the stat is the cache key rather than the value.
+_DOTENV_CACHE: dict[tuple[str, int, int], dict[str, str]] = {}
+
+# (path, mtime_ns, size) -> {"label": str}; same stat-keyed shape as the dotenv
+# cache, and for the same reason: config.yaml is hot-reloadable under a
+# long-lived gateway.
+_LABEL_CACHE: dict[tuple[str, int, int], dict[str, str]] = {}
+
+# Keys already warned about in this process, so a per-turn resolve doesn't spam.
+_WARNED: set[str] = set()
+
+
+class ACPConfigError(RuntimeError):
+    """Raised when two sources disagree about how the bridge should run."""
+
+
+def _truthy(value: Any) -> bool:
+    return str(value or "").strip().lower() in _TRUTHY
+
+
+def hermes_home() -> Path:
+    return Path(os.getenv("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
+
+
+def dotenv_path() -> Path:
+    return hermes_home() / ".env"
+
+
+def config_path() -> Path:
+    return hermes_home() / "config.yaml"
+
+
+def read_dotenv(var: str, *, path: Path | None = None) -> str | None:
+    """Value of ``var`` as written in ``.env``, independent of ``os.environ``.
+
+    Reading the file rather than the process env is the whole point: it is what
+    lets us tell "the single source says X" apart from "something upstream of us
+    exported X".
+    """
+    env_path = path or dotenv_path()
+    try:
+        stat = env_path.stat()
+    except OSError:
+        return None
+    key = (str(env_path), stat.st_mtime_ns, stat.st_size)
+    parsed = _DOTENV_CACHE.get(key)
+    if parsed is None:
+        parsed = {}
+        try:
+            text = env_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            name, _, value = line.partition("=")
+            name = name.strip()
+            if not name:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            parsed[name] = value
+        _DOTENV_CACHE.clear()
+        _DOTENV_CACHE[key] = parsed
+    return parsed.get(var)
+
+
+def normalize_model(value: Any) -> str | None:
+    """A usable engine model name, or ``None`` if this isn't one.
+
+    Accepts a provider-qualified reference (``anthropic/claude-opus-5``) and
+    returns the bare engine name the ACP wrapper wants.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if "/" in text:
+        text = text.rsplit("/", 1)[-1].strip()
+    return text if _ENGINE_MODEL_RE.match(text) else None
+
+
+def config_label(*, path: Path | None = None) -> str | None:
+    """``model.default`` as written in the profile's ``config.yaml``.
+
+    The *label*, deliberately named so: on an ACP profile it does not decide
+    anything (``.env`` does), it only records what the profile calls itself.
+    ``None`` when the file is missing, unparseable, or names something that is
+    not an engine model — every one of those means "cannot tell", and every
+    caller here treats "cannot tell" as "leave the pin in charge".
+    """
+    cfg_path = path or config_path()
+    try:
+        stat = cfg_path.stat()
+    except OSError:
+        return None
+    key = (str(cfg_path), stat.st_mtime_ns, stat.st_size)
+    cached = _LABEL_CACHE.get(key)
+    if cached is None:
+        try:
+            import yaml  # lazy: bare-python callers of this module have no deps
+
+            raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+            model_cfg = raw.get("model")
+            if isinstance(model_cfg, str):
+                value = model_cfg
+            elif isinstance(model_cfg, dict):
+                value = model_cfg.get("default") or model_cfg.get("model")
+            else:
+                value = None
+        except Exception:
+            return None
+        cached = {"label": normalize_model(value) or ""}
+        _LABEL_CACHE.clear()
+        _LABEL_CACHE[key] = cached
+    return cached["label"] or None
+
+
+def explicit_choice(requested: Any, *, path: Path | None = None) -> str | None:
+    """The requested model, when something other than ``config.yaml`` chose it.
+
+    This is the whole discriminator, and it needs no plumbing: an ACP agent's
+    model comes from the profile's config label unless a ``/model`` session
+    override, a ``-m`` flag or a subagent's ``model=`` put something else there.
+    So *differing from the label* is exactly "explicitly chosen for this run",
+    and *equal to the label* is exactly "nobody chose, this is just the config".
+
+    Keeping those apart is the point. Before this, ``/model claude-fable-5``
+    moved the label and the agent's model, the pin answered anyway, and the
+    session was told it had switched — the 2026-08-06 researcher case and the
+    2026-08-09 one both. Letting *any* differing request win would fix that and
+    silently re-open it: editing ``config.yaml`` would move the profile again,
+    against the single-source rule and against ``bridge-doctor``'s env check.
+
+    ``None`` whenever we cannot tell (no config, unreadable, no usable request),
+    because "cannot tell" must keep today's behaviour, not invent a switch.
+    """
+    wanted = normalize_model(requested)
+    if not wanted:
+        return None
+    label = config_label(path=path)
+    if not label:
+        return None
+    if label.casefold() == wanted.casefold():
+        return None
+    return wanted
+
+
+def pin_overrides_request(env_value: Any, requested: Any) -> str | None:
+    """The model Hermes asked for, when the ``.env`` pin will answer instead.
+
+    ``None`` whenever there is nothing to tell an operator about:
+
+    * nothing usable was requested — the aux path hands over provider labels
+      (``"copilot-acp"``), and "you asked for a provider" is not news;
+    * the two name the same engine. The comparison normalises first, so
+      ``model.default: anthropic/claude-opus-5`` against
+      ``HERMES_ACP_MODEL=claude-opus-5`` is silence, not a daily false alarm.
+
+    Split out from :func:`resolve_model` so the predicate can be tested (and
+    mutated) without asserting on log records.
+    """
+    wanted = normalize_model(requested)
+    if not wanted:
+        return None
+    pinned = normalize_model(env_value) or str(env_value or "").strip()
+    if not pinned or pinned.casefold() == wanted.casefold():
+        return None
+    return wanted
+
+
+def resolve_model(requested: Any = None) -> str:
+    """The model the ACP bridge will actually run, from the single source.
+
+    Order: an *explicitly chosen* model (:func:`explicit_choice`) →
+    ``HERMES_ACP_MODEL`` (verbatim) → the model Hermes asked for → the legacy
+    default. Whatever comes out is written into the wrapper's environment by
+    ``_acp_env_with_model``, so Python and the shell still cannot disagree.
+
+    The pin winning over a *different* requested model is by design for the
+    config label — an ACP profile is moved by ``.env``, never by
+    ``model.default`` — and it is
+    also how a profile ends up merely *believing* it switched: on 2026-08-06
+    researcher rewrote its own ``config.yaml`` to ``claude-fable-5``, answered a
+    "say ok" probe (which proves something is alive, not *who* answered) and
+    reported the switch done — while every turn for the next three hours ran the
+    pinned opus-5. Nothing was wrong except that nobody was told. The single
+    daily detector was ``bridge-doctor``'s ledger diff, 13 hours later. So say
+    it here, once per (pin, requested) pair, at the moment of substitution.
+    """
+    env_value = str(os.getenv(MODEL_VAR) or "").strip()
+    if env_value:
+        chosen = explicit_choice(requested)
+        if chosen and chosen.casefold() != env_value.casefold():
+            # Somebody picked this model for this run (see explicit_choice).
+            # The pin still reaches the wrapper — _acp_env_with_model writes
+            # whatever we return into the child's HERMES_ACP_MODEL — so the
+            # "Python and the shell can never disagree" invariant is unharmed.
+            _warn_once(
+                f"acp-model-explicit:{env_value}:{chosen}",
+                "%s=%r in %s is the profile pin, but %r was explicitly chosen "
+                "for this run (session /model, -m, or a subagent's model=) — "
+                "answering on %r.",
+                MODEL_VAR, env_value, dotenv_path(), chosen, chosen,
+            )
+            return chosen
+        wanted = pin_overrides_request(env_value, requested)
+        if wanted:
+            _warn_once(
+                f"acp-model-pinned:{env_value}:{wanted}",
+                "%s=%r in %s overrides the requested model %r — this run answers "
+                "on %r. Editing model.default in config.yaml does NOT move an ACP "
+                "profile; the pin is the single source.",
+                MODEL_VAR, env_value, dotenv_path(), wanted, env_value,
+            )
+        return env_value
+    wanted = normalize_model(requested)
+    if wanted:
+        _warn_once(
+            "acp-model-from-request",
+            "%s is unset; falling back to the requested model %r instead of the "
+            "legacy default %r. Set it in %s to make this explicit.",
+            MODEL_VAR, wanted, LEGACY_DEFAULT_MODEL, dotenv_path(),
+        )
+        return wanted
+    _warn_once(
+        "acp-model-default",
+        "%s is unset and no usable model was requested; using the legacy "
+        "default %r. Set it in %s.",
+        MODEL_VAR, LEGACY_DEFAULT_MODEL, dotenv_path(),
+    )
+    return LEGACY_DEFAULT_MODEL
+
+
+def native_tools_enabled() -> bool:
+    """Whether the engine drives Hermes tools natively over MCP."""
+    return _truthy(os.getenv(NATIVE_VAR, "0"))
+
+
+def read_pins(*, path: Path | None = None) -> dict[str, str]:
+    """The managed keys as written in ``.env`` — file, not process env."""
+    env_path = path or dotenv_path()
+    out: dict[str, str] = {}
+    for var in MANAGED_VARS:
+        value = read_dotenv(var, path=env_path)
+        if value is not None and value.strip():
+            out[var] = value.strip()
+    return out
+
+
+def set_pins(updates: dict[str, str], *, path: Path | None = None) -> dict[str, str]:
+    """Rewrite only the managed keys, byte-preserving everything else.
+
+    Two properties this function must have, both learned the hard way:
+
+    * **Atomic.** Temp file in the same directory + ``os.replace``, mode copied
+      off the original — a crash mid-write leaves the old ``.env``, not a
+      truncated one, and ``600`` survives the edit.
+    * **Also updates ``os.environ``.** ``.env`` is copied into the process env
+      once, at import. A long-lived gateway that only rewrote the file would go
+      on spawning bridges with the *old* pin until someone restarted it — the
+      switch would look done and not be, which is the exact failure this whole
+      module exists to prevent.
+
+    Returns the managed keys as re-read from disk, so callers verify by reading
+    the file back rather than by trusting what they meant to write.
+    """
+    env_path = path or dotenv_path()
+    clean: dict[str, str] = {}
+    for var, value in updates.items():
+        if var not in MANAGED_VARS:
+            raise ValueError(f"{var} is not a managed key: {MANAGED_VARS}")
+        model = normalize_model(value)
+        if not model:
+            raise ValueError(f"not an engine model name: {value!r}")
+        clean[var] = model
+
+    original = env_path.read_text(encoding="utf-8")
+    mode = env_path.stat().st_mode & 0o777
+    lines = original.splitlines(keepends=True)
+    seen: set[str] = set()
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key = stripped.partition("=")[0].strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        if key in clean:
+            newline = "\n" if line.endswith("\n") else ""
+            lines[i] = f"{key}={clean[key]}{newline}"
+            seen.add(key)
+    missing = [k for k in clean if k not in seen]
+    if missing:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines += [f"{k}={clean[k]}\n" for k in missing]
+
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(dir=str(env_path.parent), prefix=".env.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("".join(lines))
+        os.chmod(tmp, mode)
+        os.replace(tmp, env_path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+    for key, value in clean.items():
+        os.environ[key] = value
+    return read_pins(path=env_path)
+
+
+def _warn_once(key: str, fmt: str, *args: Any) -> None:
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    log.warning(fmt, *args)
+
+
+def divergences(*, path: Path | None = None) -> list[dict[str, str]]:
+    """Every disagreement between the process env and the single source.
+
+    Two ``kind``s, both ``severity: "fatal"``:
+
+    ``unsourced``
+        The process env decides the value and ``.env`` is silent. The one that
+        actually happens (``.env`` wins whenever it speaks), and the one that
+        made three profiles answer on ``claude-opus-4-8`` from the CLI for days.
+    ``conflict``
+        Both name a value and they differ. Unreachable after
+        ``load_hermes_dotenv()`` — reported for file-level callers that pass an
+        explicit ``path``, and so a loader change can't silently disarm this.
+    """
+    out: list[dict[str, str]] = []
+    for var in (MODEL_VAR, NATIVE_VAR):
+        env_value = str(os.getenv(var) or "").strip()
+        file_value = read_dotenv(var, path=path)
+        file_value = "" if file_value is None else file_value.strip()
+        if env_value and file_value and env_value != file_value:
+            out.append({
+                "var": var,
+                "kind": "conflict",
+                "severity": "fatal",
+                "env": env_value,
+                "dotenv": file_value,
+                "detail": (
+                    f"{var}={env_value!r} in the process environment but "
+                    f"{file_value!r} in {path or dotenv_path()}."
+                ),
+            })
+        elif env_value and not file_value:
+            out.append({
+                "var": var,
+                "kind": "unsourced",
+                "severity": "fatal",
+                "env": env_value,
+                "dotenv": "",
+                "detail": (
+                    f"{var}={env_value!r} was decided outside "
+                    f"{path or dotenv_path()}, which says nothing. This process "
+                    f"uses {env_value!r}; CLI runs of the same profile "
+                    f"(ask-hermes, hermes -p … -z) resolve their own answer."
+                ),
+            })
+    return out
+
+
+def enforce(context: str = "cli", *, path: Path | None = None) -> list[dict[str, str]]:
+    """Fail fast on a second source of truth; return what was found.
+
+    ``context="gateway"`` raises :class:`ACPConfigError` on a fatal divergence —
+    a long-lived service that answers on a model nobody chose is worse than one
+    that refuses to start and says why. Every other context logs instead, so a
+    one-off CLI override stays possible; ``HERMES_ACP_ALLOW_ENV_OVERRIDE=1``
+    downgrades the gateway too.
+    """
+    found = divergences(path=path)
+    fatal = [d for d in found if d["severity"] == "fatal"]
+    for d in found:
+        if d["severity"] != "fatal":
+            _warn_once(f"acp-config-warn:{d['var']}", "ACP config: %s", d["detail"])
+    if not fatal:
+        return found
+    allowed = _truthy(os.getenv(OVERRIDE_VAR))
+    message = (
+        "ACP bridge configuration has more than one source of truth:\n  "
+        + "\n  ".join(d["detail"] for d in fatal)
+        + f"\nSingle source is {path or dotenv_path()}. Remove the duplicate "
+        f"(systemd drop-in Environment=, shell export), or set "
+        f"{OVERRIDE_VAR}=1 for a deliberate one-off override."
+    )
+    if context == "gateway" and not allowed:
+        log.critical("%s", message)
+        raise ACPConfigError(message)
+    log.error("%s", message)
+    return found
+
+
+def snapshot(*, path: Path | None = None) -> dict[str, Any]:
+    """Machine-readable state for ``bridge-doctor`` and tests."""
+    return {
+        "hermes_home": str(hermes_home()),
+        "dotenv": str(path or dotenv_path()),
+        "model": {
+            "env": str(os.getenv(MODEL_VAR) or "").strip(),
+            "dotenv": (read_dotenv(MODEL_VAR, path=path) or "").strip(),
+            "resolved": resolve_model(),
+        },
+        "native_tools": {
+            "env": str(os.getenv(NATIVE_VAR) or "").strip(),
+            "dotenv": (read_dotenv(NATIVE_VAR, path=path) or "").strip(),
+            "resolved": native_tools_enabled(),
+        },
+        "divergences": divergences(path=path),
+    }
