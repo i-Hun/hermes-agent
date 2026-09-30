@@ -388,6 +388,11 @@ have no `-900k` variant. When the authenticated Codex catalog publishes a
 variant resolves to that live maximum instead; 900K remains the offline
 fallback and a published maximum above 900K does not raise it.
 
+`gpt-6.1-sol-900k` uses the same picker-only suffix, but its ceiling and offline
+fallback are **872K**, matching the account catalog's published maximum. Its
+base slug `gpt-6.1-sol` stays at the advertised 272K. A lower live account ceiling
+also clamps the extended variant; the suffix does not promise a 900K window.
+
 Compaction thresholds follow the window: base slugs (272K) get the **85%
 autoraise** described above, while `-900k` variants keep your global
 `compression.threshold` (default 50%, ~450K) — the autoraise exists to stop
