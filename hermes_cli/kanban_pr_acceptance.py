@@ -10,6 +10,8 @@ import re
 import subprocess
 from urllib.parse import quote
 
+from hermes_cli.kanban_pr_acceptance_policy import PlanGatedRules, is_plan_gated, local_policy, review_verdict
+
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
 
@@ -29,7 +31,11 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False):
     if paginate:
         command += ["--paginate", "--slurp"]
     result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
-                            text=True, timeout=30, check=True)
+                            text=True, timeout=30)
+    if result.returncode:
+        if is_plan_gated(result.stdout):
+            raise PlanGatedRules(endpoint)
+        raise subprocess.CalledProcessError(result.returncode, command)
     value = json.loads(result.stdout)
     if isinstance(value, dict) and value.get("errors"):
         raise ValueError("GitHub returned incomplete GraphQL evidence")
@@ -61,7 +67,18 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
+        policy = None
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
+        except PlanGatedRules:
+            # The plan hides rules; only an owner-declared policy may stand in, and only when
+            # classic protection is also absent (otherwise GitHub's own rules stay authoritative).
+            policy = local_policy(repo)
+            if policy is None or protection:
+                raise ValueError("Branch rules are plan-gated and no local acceptance policy is declared")
+            rules = []
+            required.update((c, None) for c in policy["required_contexts"])
+            receipt["policy"] = {"source": "kanban.pr_acceptance.local_policies", "repo": repo, **policy}
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
@@ -100,6 +117,17 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
             receipt.update(classification="stale", detail="PR head/base changed while collecting evidence; retry.")
             return receipt
+        if policy is not None:
+            if policy["require_merged"]:
+                merged = bool(current.get("merged")) and bool(re.fullmatch(r"[0-9a-f]{40}", current.get("merge_commit_sha") or ""))
+                outcomes.append("success" if merged else "pending")
+                receipt["checks"].append({"name": "merged", "classification": outcomes[-1], "head_sha": sha,
+                                          "merge_commit_sha": current.get("merge_commit_sha") if merged else None})
+            if policy["review_approve"]:
+                comments = [c for page in _api(f"repos/{repo}/issues/{number}/comments?per_page=100", paginate=True) for c in page]
+                verdict, evidence = review_verdict(comments, sha, current["head"]["ref"])
+                outcomes.append(verdict)
+                receipt["checks"].append(evidence)
         receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
         receipt["ok"] = receipt["classification"] == "success"
         return receipt

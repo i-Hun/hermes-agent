@@ -66,6 +66,27 @@ acceptance, unreadable policy or GitHub API failures. A repository without requi
 checks needs a local-only contract. `gh` must be authenticated with read access to
 the repository's checks and rules; no remote writes are performed by this gate.
 
+Private repositories on GitHub Free cannot read rulesets: GitHub answers
+`rules/branches` with HTTP 403 "Upgrade to GitHub Pro". If such a repository gates
+merges with a self-hosted status and a SHA-bound review comment, the owner can
+declare that gate for that one repository in `config.yaml`:
+
+```yaml
+kanban:
+  pr_acceptance:
+    local_policies:
+      OWNER/REPO:
+        required_contexts: [ci/local]  # exact-head status/check run, must be success
+        review_approve: true           # last "REVIEW: APPROVE" comment: sha = head, reviewer-card != card/<author>
+        require_merged: true           # PR must be MERGED with a merge commit
+```
+
+The declaration is used only for that specific plan-gated 403, and only when the
+branch has no classic protection. Any other 403, an API outage, a missing or
+malformed declaration, a red/pending/missing context, a stale or self-issued
+approval, or an unmerged PR keeps the card open. The receipt records the policy
+together with the status ID, approval comment and merge commit.
+
 Rejection retains the active card and workspace. Durable `pr_acceptance` events
 store PR URL, SHA, required contexts, check IDs/URLs, classifications and recovery
 instructions; `last_failure_error` surfaces the next step. Fix failures, rerun
