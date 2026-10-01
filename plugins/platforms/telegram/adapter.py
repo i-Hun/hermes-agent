@@ -12,6 +12,7 @@ import re
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
+from collections.abc import Mapping
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
 from hermes_cli import setup_platforms
 
@@ -332,6 +333,27 @@ def check_telegram_requirements() -> bool:
         return False
     TELEGRAM_AVAILABLE = True
     return True
+
+
+def _is_rich_only_message(message) -> bool:
+    """True for a message whose only content is a Bot API 10.1 ``rich_message`` (no text/caption).
+    PTB does not model the field yet and keeps it in ``api_kwargs``."""
+    if getattr(message, "text", None) or getattr(message, "caption", None):
+        return False
+    api_kwargs = getattr(message, "api_kwargs", None)
+    rich = api_kwargs.get("rich_message") if isinstance(api_kwargs, Mapping) else None
+    return isinstance(rich, Mapping) and bool(rich.get("blocks"))
+
+
+def _rich_only_message_filter():
+    """PTB filter wrapping ``_is_rich_only_message``; built lazily because ``filters`` is imported on demand."""
+    class _RichOnlyMessage(filters.MessageFilter):
+        __slots__ = ()
+
+        def filter(self, message) -> bool:
+            return _is_rich_only_message(message)
+
+    return _RichOnlyMessage(name="RichOnlyMessage")
 
 
 # Every char MarkdownV2 requires backslash-escaped outside code spans/fences.
@@ -2929,6 +2951,9 @@ class TelegramAdapter(BasePlatformAdapter):
         table = getattr(app, "handlers", None)
         core_before = {g: len(hs) for g, hs in table.items()} if isinstance(table, dict) else {}
         app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message))
+        # Bot API 10.1 rich messages (e.g. a forwarded sendRichMessage post) carry no ``text``/``caption``,
+        # so no stock filter matches them and the update was acked with nothing dispatched.
+        app.add_handler(TelegramMessageHandler(_rich_only_message_filter(), self._handle_text_message))
         app.add_handler(TelegramMessageHandler(filters.COMMAND, self._handle_command))
         app.add_handler(TelegramMessageHandler(
             filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION), self._handle_location_message))
@@ -6433,14 +6458,16 @@ class TelegramAdapter(BasePlatformAdapter):
         media cached, attribution applied."""
         from plugins.platforms.telegram.telegram_context import group_trigger_text
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
-        event.text = group_trigger_text(self, msg, event.text)
+        # Clean the trigger from the body only: the forward header may legitimately name this bot.
+        body = expand_link_entities(msg) or self._rich_message_text(msg) or ""
+        event.text = self._with_forward_attribution(msg, group_trigger_text(self, msg, body))
         await self._cache_replied_media(msg, event)
         return self._apply_telegram_group_observe_attribution(event)
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text; buffers client-split chunks into one MessageEvent."""
         msg = self._effective_update_message(update)
-        if not msg or not msg.text:
+        if not msg or not (msg.text or self._rich_message_text(msg)):
             return
         # Auth check first: blocked users must not reach batching, the observed transcript, or the agent.
         if not self._is_user_authorized_from_message(msg):
@@ -6950,10 +6977,52 @@ class TelegramAdapter(BasePlatformAdapter):
                     lines.append(f"{label} {item_lines[0]}".strip() if label else item_lines[0])
                     lines.extend(item_lines[1:])
                 continue
+            if block.get("type") == "table":
+                for row in block.get("cells") or []:
+                    if isinstance(row, list):
+                        cells = [cls._flatten_rich_inline_text(c.get("text")) if isinstance(c, dict) else "" for c in row]
+                        lines.append("| " + " | ".join(" ".join(c.split()) for c in cells) + " |")
+                continue
             text = cls._flatten_rich_inline_text(block.get("text"))
             if text:
                 lines.extend(text.splitlines())
         return "\n".join(line.rstrip() for line in lines if line)
+
+    @classmethod
+    def _rich_message_text(cls, message: Any) -> Optional[str]:
+        """Plaintext of a message's own Bot API 10.1 ``rich_message`` (PTB keeps it in ``api_kwargs``)."""
+        return cls._extract_rich_reply_text(message)
+
+    @staticmethod
+    def _forward_origin_label(message: Any) -> Optional[str]:
+        """Human label for ``forward_origin`` (user / hidden user / chat / channel), else None."""
+        origin = getattr(message, "forward_origin", None)
+        # PTB's ``MessageOrigin.type`` is a str enum; anything else is not a forward (or a loose mock).
+        if origin is None or not isinstance(getattr(origin, "type", None), str):
+            return None
+        user = getattr(origin, "sender_user", None)
+        if user is not None:
+            name = getattr(user, "full_name", None) or getattr(user, "first_name", None) or str(getattr(user, "id", ""))
+            username = getattr(user, "username", None)
+            return f"{name} (@{username})" if username else name
+        hidden = getattr(origin, "sender_user_name", None)
+        if hidden:
+            return str(hidden)
+        chat = getattr(origin, "sender_chat", None) or getattr(origin, "chat", None)
+        if chat is not None:
+            title = getattr(chat, "title", None) or getattr(chat, "username", None) or str(getattr(chat, "id", ""))
+            signature = getattr(origin, "author_signature", None)
+            return f"{title} ({signature})" if signature else title
+        return "unknown sender"
+
+    @classmethod
+    def _with_forward_attribution(cls, message: Any, text: Optional[str]) -> str:
+        """Prefix forwarded content with its origin so the agent does not read it as the sender's own words."""
+        label = cls._forward_origin_label(message)
+        if not label:
+            return text or ""
+        header = f"[Forwarded message from {label}]"
+        return f"{header}\n{text}" if text else header
 
     @classmethod
     def _extract_rich_reply_text(cls, reply_to_message: Any) -> Optional[str]:
@@ -7072,7 +7141,8 @@ class TelegramAdapter(BasePlatformAdapter):
         _chat_id_str = str(chat.id)
         channel_prompt = resolve_channel_prompt(self.config.extra, thread_id_str or _chat_id_str, _chat_id_str if thread_id_str else None)
         return MessageEvent(
-            text=expand_link_entities(message), message_type=msg_type, source=source, raw_message=message,
+            text=self._with_forward_attribution(message, expand_link_entities(message) or self._rich_message_text(message) or ""),
+            message_type=msg_type, source=source, raw_message=message,
             message_id=str(message.message_id), platform_update_id=update_id,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text, auto_skill=topic_skill,
             channel_prompt=group_identity_prompt(self, message, channel_prompt),
