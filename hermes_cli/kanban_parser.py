@@ -388,6 +388,8 @@ _SPECS = [
     _cmd("stats", [_json_flag()], help="Per-status + per-assignee counts + oldest-ready age"),
     _cmd("notify-subscribe", [
         _TASK_ID,
+        _arg("--only-if-missing", action="store_true",
+             help="Automatic fallback: preserve any existing task subscription."),
         *_NOTIFY_TARGET,
         _arg("--user-id"),
         _arg("--user-id-alt"),

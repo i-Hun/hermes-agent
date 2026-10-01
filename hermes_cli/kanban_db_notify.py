@@ -77,6 +77,8 @@ def add_notify_sub(
     notifier_profile: Optional[str] = None,
     delivery_mode: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
+    only_if_missing: bool = False,
+    replace_owner: bool = False,
 ) -> None:
     """Register a gateway source wanting terminal-state notifications for
     ``task_id``; idempotent on (task, platform, chat, thread).
@@ -85,7 +87,9 @@ def add_notify_sub(
     replayed on active wake: ``build_session_key`` prefers the alt id, so
     omitting it would key the wake into a different session. ``None`` keeps an
     existing row's value. ``delivery_mode``: ``None`` leaves an existing row
-    untouched, an explicit valid value is last-write-wins, unknown falls back
+    untouched. ``only_if_missing`` atomically skips all existing task routes;
+    ``replace_owner`` allows an intentional CLI owner change without resetting
+    event/ping cursors. An explicit valid mode is last-write-wins, unknown falls back
     to ``"notify"``. ``delivery_metadata`` merges supplied routing anchors
     into an existing row so re-subscribing never discards them. New subs start
     caught up (``last_event_id`` =
@@ -98,6 +102,12 @@ def add_notify_sub(
     insert_mode = valid_mode or ("notify+wake" if platform == "api_server" else "notify")
     key = _sub_key(task_id, platform, chat_id, thread_id)
     with _kb.write_txn(conn):
+        # Auto writers ensure a destination, never compete with an existing
+        # work-owner policy. The transaction closes the snapshot/check race.
+        if only_if_missing and conn.execute(
+            "SELECT 1 FROM kanban_notify_subs WHERE task_id=? LIMIT 1", (task_id,)
+        ).fetchone():
+            return
         existing = conn.execute(
             "SELECT delivery_metadata FROM kanban_notify_subs " + _SUB_KEY_WHERE,
             key,
@@ -123,12 +133,12 @@ def add_notify_sub(
         )
         # chat_type / delivery_mode are last-write-wins; delivery metadata
         # preserves existing routing fields while supplied fields overwrite them.
-        # user_id, user_id_alt and notifier_profile only self-heal legacy rows lacking one.
+        # Identities self-heal unless an explicit CLI owner replacement was requested.
         for column, value, fill_only in (
             ("chat_type", chat_type, False),
             ("user_id", user_id, True),
             ("user_id_alt", user_id_alt, True),
-            ("notifier_profile", notifier_profile, True),
+            ("notifier_profile", notifier_profile, not replace_owner),
             ("delivery_mode", valid_mode, False),
             ("delivery_metadata", metadata_json, False),
         ):
