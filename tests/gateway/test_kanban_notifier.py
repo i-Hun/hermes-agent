@@ -439,6 +439,11 @@ def test_malformed_profile_config_does_not_suppress_completion_wake(tmp_path, mo
     assert len(adapter.handled) == 1
 
 
+def test_completion_wake_policy_is_a_recognized_config_key():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    assert DEFAULT_CONFIG["kanban"]["wake_on_completed"] is True
+
+
 def test_completion_wake_policy_is_isolated_by_subscriber_profile(tmp_path, monkeypatch):
     """A multiplexed notifier must not borrow the host or another profile's flag."""
     from gateway.kanban_watchers_notifier import _KanbanNotification
