@@ -572,10 +572,38 @@ class _KanbanNotification:
             self.wake_review_detail = review_detail
         return msg
 
+    def _completion_wake_enabled(self) -> bool:
+        """Use the subscriber's profile policy, not the multiplexing host's."""
+        try:
+            from hermes_cli.profiles import get_profile_dir
+            from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+            from hermes_cli.config import load_config_readonly
+            profile = self.sub_profile or self.runner._active_profile_name()
+            token = set_hermes_home_override(str(get_profile_dir(profile)))
+            try:
+                cfg = load_config_readonly()
+                from hermes_cli.config_read_errors import FailedConfigRead
+                if isinstance(cfg, FailedConfigRead):
+                    # Last-known-good may say false, but a broken current file
+                    # must not quietly suppress the only follow-up turn.
+                    return True
+                return (cfg.get("kanban") or {}).get("wake_on_completed", True) is not False
+            finally:
+                reset_hermes_home_override(token)
+        except Exception:
+            # A broken/unreadable profile setting must not silently drop a wake.
+            logger.warning("kanban notifier: could not read completion wake policy for %s", self.sub_profile, exc_info=True)
+            return True
+
     def build_wake_text(self) -> None:
         """Set ``wake_kinds`` / ``session_key`` / ``synth`` for the wake paths."""
         task, sub = self.task, self.sub
         self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()
+        # A non-push adapter (api_server) cannot send a passive ping: its
+        # self-post wake is the ONLY delivery channel. Never discard it.
+        if (self.is_push_adapter and self.send_passive and "completed" in self.wake_kinds
+                and not self._completion_wake_enabled()):
+            self.wake_kinds.remove("completed")
         self.wake_diagnostic = all(diagnostic_event(ev) for ev in self.d["events"] if ev.kind in self.wake_kinds)
         if not self.wake_kinds:
             return

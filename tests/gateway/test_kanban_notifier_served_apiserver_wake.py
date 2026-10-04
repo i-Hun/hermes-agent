@@ -169,6 +169,22 @@ def _api_sub(chat_id=SESSION, profile="builder"):
             "thread_id": "", "notifier_profile": profile, "delivery_metadata": None}
 
 
+def test_nonpush_completed_still_wakes_when_passive_delivery_is_impossible(served, monkeypatch):
+    """api_server has no send(): do not consume a completion without its only delivery."""
+    (served.builder / "config.yaml").write_text("kanban:\n  wake_on_completed: false\n", encoding="utf-8")
+    _own_session(served.builder, SESSION, "builder")
+    kb.init_db()
+    adapter = RecordingApiServerAdapter()
+    runner = _make_runner(adapter=adapter)
+    task = _subscription()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert [turn["session_id"] for turn in adapter.turns] == [SESSION]
+    assert task in adapter.turns[0]["text"]
+    assert _unseen(task) == []
+
+
 def test_served_profile_wake_runs_in_process_only_for_the_session_it_owns(served, monkeypatch):
     """Owned session → in-process wake in the owner's scope; everything else fails closed; the
     default profile keeps its HTTP self-post."""

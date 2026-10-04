@@ -355,6 +355,119 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     assert "stopped unexpectedly" in adapter.sent[1]["text"].lower()
 
 
+def test_profile_can_notify_completion_without_waking_but_still_wake_blocked(tmp_path, monkeypatch):
+    """A completed task must not replay a long chat; blocked still needs triage."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "passive-completion.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        done = kb.create_task(conn, title="research done", assignee="researcher")
+        blocked = kb.create_task(conn, title="research blocked", assignee="researcher")
+        wake_only = kb.create_task(conn, title="wake-only completion", assignee="researcher")
+        for tid in (done, blocked, wake_only):
+            kbn.add_notify_sub(
+                conn, task_id=tid, platform="telegram", chat_id="research-chat",
+                thread_id="3", chat_type="group", notifier_profile="researcher",
+                delivery_mode="wake" if tid == wake_only else "notify+wake",
+            )
+        kb.complete_task(conn, done, summary="finished")
+        kb.block_task(conn, blocked, reason="needs review", kind="needs_input")
+        kb.complete_task(conn, wake_only, summary="only wake can deliver this")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "researcher"
+    profile_home = tmp_path / "researcher"
+    profile_home.mkdir()
+    (profile_home / "config.yaml").write_text("kanban:\n  wake_on_completed: false\n")
+    monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda name: profile_home)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 2  # both notify+wake status messages remain visible
+    assert len(adapter.handled) == 2  # blocked and wake-only; completed notify+wake is passive
+    assert any("blocked" in event.text.lower() for event in adapter.handled)
+    assert any("wake-only completion" in event.text.lower() for event in adapter.handled)
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 2 and len(adapter.handled) == 2  # consumed once
+    conn = kbc.connect()
+    try:
+        for tid in (done, blocked, wake_only):
+            sub, = kbn.list_notify_subs(conn, tid)
+            assert sub["last_event_id"] > 0  # no repeated delivery
+    finally:
+        conn.close()
+
+
+def test_malformed_profile_config_does_not_suppress_completion_wake(tmp_path, monkeypatch):
+    """A last-good false policy must not silently survive a failed config read."""
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.config_read_errors import FailedConfigRead
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "bad-config.db"))
+    kb.init_db()
+    profile_home = tmp_path / "researcher"
+    profile_home.mkdir()
+    config_path = profile_home / "config.yaml"
+    config_path.write_text("kanban:\n  wake_on_completed: false\n")
+    monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda name: profile_home)
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        assert load_config_readonly()["kanban"]["wake_on_completed"] is False
+        config_path.write_text("kanban: [unclosed\n")
+        assert isinstance(load_config_readonly(), FailedConfigRead)
+    finally:
+        reset_hermes_home_override(token)
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="must wake on config error", assignee="researcher")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="research-chat",
+                           thread_id="3", chat_type="group", notifier_profile="researcher",
+                           delivery_mode="notify+wake")
+        kb.complete_task(conn, tid, summary="finished")
+    finally:
+        conn.close()
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "researcher"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+
+
+def test_completion_wake_policy_is_a_recognized_config_key():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    assert DEFAULT_CONFIG["kanban"]["wake_on_completed"] is True
+
+
+def test_completion_wake_policy_is_isolated_by_subscriber_profile(tmp_path, monkeypatch):
+    """A multiplexed notifier must not borrow the host or another profile's flag."""
+    from gateway.kanban_watchers_notifier import _KanbanNotification
+    homes = {}
+    for name, setting in (("default", "true"), ("researcher", "false"), ("secretary", "true")):
+        home = tmp_path / name
+        home.mkdir()
+        (home / "config.yaml").write_text(f"kanban:\n  wake_on_completed: {setting}\n")
+        homes[name] = home
+    monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda name: homes[name])
+    runner = _make_runner(RecordingAdapter())
+    runner._active_profile_name = lambda: "default"
+    policies = {}
+    for name in ("researcher", "secretary", "default"):
+        sub = {"platform": "telegram", "task_id": "t_test", "chat_id": "chat",
+               "notifier_profile": name, "delivery_mode": "notify+wake"}
+        notification = _KanbanNotification(
+            runner, {"sub": sub, "task": None, "events": [], "board": "default"},
+            platform_cls=Platform, sub_fail_counts={},
+        )
+        policies[name] = notification._completion_wake_enabled()
+    assert policies == {"researcher": False, "secretary": True, "default": True}
+
+
 def test_notifier_subscription_survives_done_reopen_until_archive(
     tmp_path, monkeypatch,
 ):
