@@ -3005,9 +3005,12 @@ def _completed_event_payload(
     notifiers / dashboard WS render without a second round-trip; verified
     cards; and ``metadata["artifacts"]`` promoted so the notifier can upload
     them as native attachments without fetching the run row."""
-    from hermes_cli.kanban_completion_origin import completion_origin
+    # Mirror CLI's _show_voice_status: include STT/TTS provider availability so the user can tell at a
+    # glance *why* voice mode isn't working ("STT provider: MISSING ..." is the common case). ``record_key``
+    # mirrors the configured ``voice.record_key`` so the TUI can both bind it (frontend
+    # ``isVoiceToggleKey``) and display it in /voice status — previously the TUI hardcoded Ctrl+B and
+    # ignored the config (#18994).
     payload: dict = {
-        "completion_origin": completion_origin(),
         "result_len": len(result) if result else 0,
         "summary": _first_line(event_summary, 400) or None,
     }
