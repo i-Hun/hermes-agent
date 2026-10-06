@@ -1133,6 +1133,17 @@ Built-in decomposition also inherits its root's durable session. Session lineage
 
 A chat-originated auto-subscribe is created in `notify+wake` mode: on a terminal event the destination agent both receives the passive message **and** takes a real turn, so it can read the board context and reply in its own voice. See [Delivery modes](#delivery-modes) below.
 
+### Self-completion notifications
+
+A completion records the acting session separately from the task's creator. When
+that actor is provably the same session as a subscription's destination, the
+notifier consumes the event without starting another agent turn. Passive messages
+and artifacts remain unchanged. Other sessions (including workers of the same
+profile), unknown/legacy origins, and blocked/review/error events still follow the
+subscription's delivery mode. A reset or resumed push-channel session is not
+considered the original actor. The event remains in the audit log and its delivery
+cursor advances normally; this is not an assignee-wide mute.
+
 ### Output truncation in messaging
 
 Gateway platforms have practical message-length caps. If `/kanban list`, `/kanban show`, or `/kanban tail` produce more than ~3800 characters of output, the response is truncated with a `… (truncated; use \`hermes kanban …\` in your terminal for full output)` footer. The CLI surface has no such cap.

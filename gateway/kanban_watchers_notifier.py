@@ -772,12 +772,19 @@ class _KanbanNotification:
             if not await self._send_pings():
                 return
             # All text pings delivered (or skipped for non-push / wake-only).
+            from gateway.kanban_completion_origin import is_self_completion
             original_events = self.d["events"]
+            wake_events = []
+            for ev in original_events:
+                if await asyncio.to_thread(is_self_completion, ev, self.sub, self.runner, is_push=self.is_push_adapter):
+                    logger.info("kanban notifier: suppressed self-completion wake for %s event=%s", self.task_id, ev.id)
+                else:
+                    wake_events.append(ev)
             from gateway.warning_notifications import warning_notifications_enabled
             split = not warning_notifications_enabled(self.platform_str)
-            wake_groups = ([original_events] if not split else [
-                [ev for ev in original_events if diagnostic_event(ev)],
-                [ev for ev in original_events if not diagnostic_event(ev)],
+            wake_groups = ([wake_events] if not split else [
+                [ev for ev in wake_events if diagnostic_event(ev)],
+                [ev for ev in wake_events if not diagnostic_event(ev)],
             ])
             wake_payloads = []
             for events in wake_groups:
