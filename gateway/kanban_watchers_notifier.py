@@ -632,7 +632,6 @@ class _KanbanNotification:
     async def wake(self) -> None:
         """Wake the creator session (raises on failure): push adapters get a full SessionSource, non-push a raw self-post."""
         from gateway.wake import deliver_wake
-        sub = self.sub
         if not self.is_push_adapter:
             # A served profile's raw-session wake runs in THAT profile's scope, in-process: the
             # shared listener's /p/<profile>/ self-post would need the profile's own
@@ -644,7 +643,20 @@ class _KanbanNotification:
                                    notification_category="diagnostic" if self.wake_diagnostic else "result")
             self._log_woke()
             return
+        _source = self._wake_source()
+        from gateway.run import _async_profile_runtime_scope
+        if self.sub_profile and getattr(getattr(self.runner, "config", None), "multiplex_profiles", False):
+            from hermes_cli.profiles import profile_exists
+            if not profile_exists(self.sub_profile):
+                raise RuntimeError(f"Kanban wake profile {self.sub_profile!r} no longer exists")
+        async with _async_profile_runtime_scope(self.runner._resolve_profile_home_for_source(_source)):
+            await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, source=_source,
+                               notification_category="diagnostic" if self.wake_diagnostic else "result")
+        self._log_woke()
+
+    def _wake_source(self):
         from gateway.session import SessionSource
+        sub = self.sub
         # Rebuild the creator's real session scope from the persisted chat_type:
         # build_session_key() keys DMs differently from group/thread, so a
         # hardcoded "group" mis-routed DM/thread creators into a fresh session.
@@ -663,15 +675,7 @@ class _KanbanNotification:
             parent_chat_id=_delivery_meta.get("parent_chat_id"),
         )
         _source._transport_adapter_ref = weakref.ref(self.adapter)
-        from gateway.run import _async_profile_runtime_scope
-        if self.sub_profile and getattr(getattr(self.runner, "config", None), "multiplex_profiles", False):
-            from hermes_cli.profiles import profile_exists
-            if not profile_exists(self.sub_profile):
-                raise RuntimeError(f"Kanban wake profile {self.sub_profile!r} no longer exists")
-        async with _async_profile_runtime_scope(self.runner._resolve_profile_home_for_source(_source)):
-            await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, source=_source,
-                               notification_category="diagnostic" if self.wake_diagnostic else "result")
-        self._log_woke()
+        return _source
 
     async def _send_event(self, ev: Any, msg: str) -> bool:
         """Send one text ping; raises on adapter exception or SendResult(success=False)."""
@@ -776,7 +780,10 @@ class _KanbanNotification:
             original_events = self.d["events"]
             wake_events = []
             for ev in original_events:
-                if await asyncio.to_thread(is_self_completion, ev, self.sub, self.runner, is_push=self.is_push_adapter):
+                if await asyncio.to_thread(
+                    is_self_completion, ev, self.sub, self.runner, is_push=self.is_push_adapter,
+                    source=self._wake_source() if self.is_push_adapter else None,
+                ):
                     logger.info("kanban notifier: suppressed self-completion wake for %s event=%s", self.task_id, ev.id)
                 else:
                     wake_events.append(ev)

@@ -4,7 +4,7 @@ import sqlite3
 from gateway.kanban_watchers_common import logger
 
 
-def is_self_completion(event, sub, runner, *, is_push: bool) -> bool:
+def is_self_completion(event, sub, runner, *, is_push: bool, source=None) -> bool:
     if event.kind != "completed":
         return False
     origin = (event.payload or {}).get("completion_origin")
@@ -15,20 +15,16 @@ def is_self_completion(event, sub, runner, *, is_push: bool) -> bool:
         return False
     if not is_push:
         return origin["session_id"] == sub.get("chat_id")
-    metadata = sub.get("delivery_metadata") or {}
-    for key in ("platform", "chat_id", "thread_id", "user_id", "chat_type"):
-        if (origin.get(key) or "") != (sub.get(key) or metadata.get(key) or ""):
-            return False
-    scope = metadata.get("scope_id") or metadata.get("guild_id") or metadata.get("slack_team_id") or metadata.get("team_id") or ""
-    if (origin.get("scope_id") or "") != scope:
-        return False
-    if (origin.get("parent_chat_id") or "") != (metadata.get("parent_chat_id") or ""):
-        return False
-    key = origin.get("session_key")
     store = getattr(runner, "session_store", None)
-    if not key or store is None:
+    if source is None or not origin.get("session_key") or store is None:
         return False
     try:
+        # Resolve the actual delivery source with the same store/config as inbound
+        # routing. Raw user IDs differ in shared threads but not their session key;
+        # per-user isolation, alternate IDs and multiplex namespaces still apply.
+        key = runner._session_key_for_source(source)
+        if key != origin["session_key"]:
+            return False
         entry = store.lookup_by_session_key(key)
     except (OSError, sqlite3.Error):
         logger.exception("kanban: cannot verify completion actor session; retaining wake")
