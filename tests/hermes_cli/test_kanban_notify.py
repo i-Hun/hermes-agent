@@ -989,10 +989,13 @@ def test_migration_backfill_runs_only_on_first_add(kanban_home):
 # ---------------------------------------------------------------------------
 
 def _add_full_parent_sub(kb, conn, parent):
+    # Owner matches the child's assignee below: inheritance is per-owner, so a
+    # route owned by another profile is deliberately NOT copied (see
+    # test_child_does_not_inherit_another_profiles_route).
     kbn.add_notify_sub(
         conn, task_id=parent, platform="telegram", chat_id="chat1",
         thread_id="topic1", user_id="user1", user_id_alt="alt-1",
-        chat_type="dm", notifier_profile="default",
+        chat_type="dm", notifier_profile="w1",
         delivery_mode="notify+wake",
         delivery_metadata={"reply_fallback": "general", "topic_name": "ops"},
     )
@@ -1049,6 +1052,77 @@ def test_create_with_parents_inherits_delivery_metadata(kanban_home):
     finally:
         conn.close()
     _assert_full_inherited_sub(subs)
+
+# ---------------------------------------------------------------------------
+# Ownership half of the inheritance contract: a subscription's
+# ``notifier_profile`` names the profile that owns and delivers that route, so a
+# parent's route belongs to the parent's owner — not to the child. Copying a
+# foreign route onto a child subscribes a stranger's chat to this card AND costs
+# the child its own route, because the auto-subscribe path (kanban_create tool /
+# gateway `/kanban create`) skips a task that already holds ANY subscription.
+# Live case: cards assigned to one fleet agent inherited the coordinator's
+# topic from the parent card that ordered the work; the agent's own topic heard
+# nothing and the coordinator was woken for every review card it had ordered.
+# ---------------------------------------------------------------------------
+
+def _subs_of(kb, conn, task_id, kbn):
+    return kbn.list_notify_subs(conn, task_id)
+
+
+def test_child_does_not_inherit_another_profiles_route(kanban_home):
+    import hermes_cli.kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="ordering card", assignee="boss")
+        kbn.add_notify_sub(
+            conn, task_id=parent, platform="telegram", chat_id="group1", thread_id="1",
+            chat_type="group", notifier_profile="boss", delivery_mode="notify+wake",
+        )
+        kbn.add_notify_sub(
+            conn, task_id=parent, platform="telegram", chat_id="group1", thread_id="9",
+            chat_type="group", notifier_profile="worker1", delivery_mode="notify+wake",
+        )
+        child = kb.create_task(conn, title="worker child", assignee="worker1", parents=[parent])
+        subs = _subs_of(kb, conn, child, kbn)
+        assert [s["notifier_profile"] for s in subs] == ["worker1"], (
+            "the child must keep its OWN route and must not subscribe the route "
+            "owned by another profile (the ordering chat)"
+        )
+        assert subs[0]["thread_id"] == "9"
+
+        # A parent that holds ONLY a foreign route must not hand it down either: the
+        # child is left without a subscription so the auto-subscribe path can give it
+        # the assignee's own route instead of the ordering chat's.
+        foreign_only = kb.create_task(conn, title="boss-only parent", assignee="boss")
+        kbn.add_notify_sub(
+            conn, task_id=foreign_only, platform="telegram", chat_id="group1", thread_id="1",
+            chat_type="group", notifier_profile="boss", delivery_mode="notify+wake",
+        )
+        orphan = kb.create_task(
+            conn, title="worker child, no own route", assignee="worker1", parents=[foreign_only],
+        )
+        assert _subs_of(kb, conn, orphan, kbn) == []
+
+        # Unowned (legacy) rows are still inherited: the dispatching owner claims them,
+        # and a card without an assignee keeps the old inherit-everything behaviour.
+        unowned = kb.create_task(conn, title="legacy parent", assignee="boss")
+        kbn.add_notify_sub(conn, task_id=unowned, platform="telegram", chat_id="group1")
+        legacy_child = kb.create_task(
+            conn, title="legacy child", assignee="worker1", parents=[unowned],
+        )
+        assert len(_subs_of(kb, conn, legacy_child, kbn)) == 1
+        no_owner = kb.create_task(conn, title="fan-in child", parents=[parent])
+        assert len(_subs_of(kb, conn, no_owner, kbn)) == 2
+
+        # link_tasks goes through the same helper: honour ownership there too.
+        linked = kb.create_task(conn, title="linked later", assignee="worker1")
+        kb.link_tasks(conn, foreign_only, linked)
+        assert _subs_of(kb, conn, linked, kbn) == []
+    finally:
+        conn.close()
 
 # ---------------------------------------------------------------------------
 # Stale done-subscription GC (purge_stale_done_notify_subs)

@@ -1390,7 +1390,7 @@ def _inherit_notify_subs(
     conn: sqlite3.Connection, child_id: str, parents: Iterable[str], *,
     created_at: Optional[int] = None,
 ) -> None:
-    """Copy parents' notify subscriptions to a child, cursor caught up to the
+    """Copy the parents' subscriptions to a child, cursor caught up to the
     child's current event so a late ``link_tasks`` never replays history.
 
     Single owner of inheritance (create_task, link_tasks, decompose). It must
@@ -1399,6 +1399,18 @@ def _inherit_notify_subs(
 
     Omitting columns here silently degrades routing: a DM-originated child completion falls back to
     chat_type='group' and wakes a fresh group-scoped session instead of the originating DM (issue #73030).
+
+    Ownership is the second half of the contract. A subscription's
+    ``notifier_profile`` names the profile that owns and delivers that route, so
+    a parent's route belongs to the PARENT's owner — not to the child, which
+    belongs to its own ``assignee``. Copying a foreign route onto the child
+    subscribes a stranger's chat to this card, and because the auto-subscribe
+    path skips a task that already holds ANY subscription, the copy also costs
+    the child its own route: the assignee's completion is then delivered to
+    whoever ordered the work and the assignee is never told. Only rows with no
+    owner (legacy rows claimed by the dispatching owner) and rows owned by the
+    child's ``assignee`` are inherited; a card with no assignee inherits
+    everything, as before.
     """
     parent_ids = tuple(dict.fromkeys(p for p in parents if p))
     if not parent_ids:
@@ -1408,6 +1420,17 @@ def _inherit_notify_subs(
     ).fetchone()
     cursor = int(row["cursor"] if row is not None else 0)
     placeholders = ",".join("?" * len(parent_ids))
+    child_row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (child_id,),
+    ).fetchone()
+    owner = (child_row["assignee"] if child_row is not None else None) or None
+    owner_where, owner_params = "", ()
+    if owner:
+        owner_where = (
+            " AND (notifier_profile IS NULL OR notifier_profile = ''"
+            " OR notifier_profile = ?)"
+        )
+        owner_params = (owner,)
     conn.execute(
         f"""
         INSERT OR IGNORE INTO kanban_notify_subs
@@ -1418,9 +1441,12 @@ def _inherit_notify_subs(
                COALESCE(chat_type, 'dm'), notifier_profile,
                COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
           FROM kanban_notify_subs
-         WHERE task_id IN ({placeholders})
+         WHERE task_id IN ({placeholders}){owner_where}
         """,
-        (child_id, int(created_at if created_at is not None else time.time()), cursor, *parent_ids),
+        (
+            child_id, int(created_at if created_at is not None else time.time()), cursor,
+            *parent_ids, *owner_params,
+        ),
     )
 
 
