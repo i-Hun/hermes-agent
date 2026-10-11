@@ -74,6 +74,13 @@ class _ManagedAttempt:
         self, runtime: relay_runtime.RelayRuntime, session: Any, parent: Any,
         request: dict[str, Any], metadata: dict[str, Any] | None, *, name: str, model_name: str,
     ) -> None:
+        from hermes_cli.runtime_provider_backends import _is_external_process_provider
+
+        # Message format does not imply HTTP transport (process providers can
+        # expose an OpenAI-shaped facade without accepting SDK header kwargs).
+        metadata = dict(metadata or {})
+        if _is_external_process_provider(name):
+            metadata["transport_supports_extra_headers"] = False
         self.runtime, self.session, self.request, self.metadata = runtime, session, request, metadata
         self.logical = _logical_parent(runtime, session, parent, metadata)
         self.parent = self.logical[1] if self.logical is not None else parent
@@ -125,15 +132,36 @@ class _ManagedAttempt:
             raise
 
     def invoke(self, callback: Callable[..., Any], next_request: Any) -> Any:
-        """Provider callback handed to Relay: run ``callback`` on Relay's (possibly rewritten) request."""
+        """Provider callback handed to Relay on its possibly rewritten request.
+
+        A provider that raises synchronously must still raise here — Relay's own
+        wrapping and Hermes' error recovery read that as the provider's error.
+        Only a callback that actually hands back an awaitable (a dual-mode facade
+        that picked its async API because a loop is running) is returned as one
+        for Relay to await, so the provider call stays owned by this attempt's
+        captured context.
+        """
         with self._recording_errors():
             raw = self.run_callback(callback, self.provider_request(next_request))
+        if _has_running_event_loop() and inspect.isawaitable(raw):
+            return self.await_provider_result(raw)
         return self._record(raw)
+
+    async def await_provider_result(self, raw: Any) -> Any:
+        """Await a provider coroutine in a task owned by this attempt's context."""
+        async def call_provider() -> Any:
+            with relay_runtime.managed_callback_guard():  # nested relay calls run unmanaged
+                return await raw
+
+        with self._recording_errors():
+            value = await self.context.copy().run(asyncio.create_task, call_provider())
+        return self._record(value)
 
     async def invoke_async(self, callback: Callable[..., Any], next_request: Any) -> Any:
         async def call_provider() -> Any:
             with relay_runtime.managed_callback_guard():  # nested relay calls run unmanaged
-                return await callback(final_request)
+                raw = callback(final_request)
+                return await raw if inspect.isawaitable(raw) else raw
 
         with self._recording_errors():
             final_request = self.provider_request(next_request)
@@ -338,25 +366,65 @@ class ManagedLlmStream(Iterator[Any]):
         self._stream = iter(raw_stream)
 
     async def _provider_stream(self, attempt: _ManagedAttempt, next_request: Any):
-        """Relay's provider callback: run the factory and yield JSON-encoded chunks."""
-        run_callback = attempt.run_callback
-        raw_stream = None
+        """Own the full provider lifecycle in one task and captured context.
+
+        Async generators may keep ContextVar tokens or task-bound scopes across
+        yields. A task per pull loses that ownership. The acknowledgement keeps
+        this producer lazy, while cancellation always joins provider cleanup.
+        """
+        messages: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        resume = asyncio.Event()
+
+        async def produce() -> None:
+            with relay_runtime.managed_callback_guard():
+                provider = self._provider_stream_body(attempt, next_request)
+                try:
+                    async with contextlib.aclosing(provider):
+                        async for chunk in provider:
+                            messages.put_nowait(("chunk", chunk))
+                            await resume.wait()
+                            resume.clear()
+                except BaseException as exc:
+                    messages.put_nowait(("error", exc))
+                else:
+                    messages.put_nowait(("done", None))
+
+        task = attempt.context.copy().run(asyncio.create_task, produce())
         try:
-            raw_stream = run_callback(self._stream_factory, attempt.provider_request(next_request))
+            while True:
+                kind, value = await messages.get()
+                if kind == "error":
+                    raise value
+                if kind == "done":
+                    return
+                yield value
+                resume.set()
+        finally:
+            if not task.done():
+                task.cancel()
+            await task
+
+    async def _provider_stream_body(self, attempt: _ManagedAttempt, next_request: Any):
+        raw_stream = raw_iterator = None
+        try:
+            raw_stream = self._stream_factory(attempt.provider_request(next_request))
+            if inspect.isawaitable(raw_stream):
+                raw_stream = await raw_stream
             predicate = self._completed_response_predicate
-            if predicate is not None and run_callback(predicate, raw_stream):
+            if predicate is not None and predicate(raw_stream):
                 self.final_response = raw_stream
                 self._provider_completed = True
                 return
             if self._on_stream_created is not None:
-                run_callback(self._on_stream_created, raw_stream)
-            raw_iterator = run_callback(iter, raw_stream)
+                self._on_stream_created(raw_stream)
+            is_async = hasattr(raw_stream, "__aiter__")
+            raw_iterator = aiter(raw_stream) if is_async else iter(raw_stream)
             while True:
                 try:
-                    chunk = run_callback(next, raw_iterator)
-                except StopIteration:
+                    chunk = await anext(raw_iterator) if is_async else next(raw_iterator)
+                except (StopIteration, StopAsyncIteration):
                     break
-                if self._accept_chunk is not None and not run_callback(self._accept_chunk, chunk):
+                if self._accept_chunk is not None and not self._accept_chunk(chunk):
                     break
                 encoded_chunk = _jsonable(chunk)
                 self._raw_chunks.append((encoded_chunk, chunk))
@@ -366,13 +434,24 @@ class ManagedLlmStream(Iterator[Any]):
             self._callback_error = exc
             raise
         finally:
-            close = getattr(raw_stream, "close", None)
-            if callable(close):
-                try:
-                    run_callback(close)
-                except BaseException as exc:
-                    self._close_error = exc
-                    raise
+            # An iterable may create a separately owned iterator. Close both,
+            # once each, even if closing the iterator itself fails.
+            try:
+                if raw_iterator is not raw_stream:
+                    await self._close_provider_resource(raw_iterator)
+            finally:
+                await self._close_provider_resource(raw_stream)
+
+    async def _close_provider_resource(self, resource: Any) -> None:
+        close = getattr(resource, "aclose", None) or getattr(resource, "close", None)
+        if callable(close):
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            except BaseException as exc:
+                self._close_error = exc
+                raise
 
     def _relay_finalizer(self, attempt: _ManagedAttempt) -> Any:
         # Relay may call this while unwinding a provider-stream failure; keep the original
@@ -777,7 +856,10 @@ def _provider_request(
     # Relay's managed-call trace header maps to ``extra_headers`` for known SDK adapters and custom
     # requests that already use that container; other native transports take protocol kwargs directly
     # and may reject an SDK-only argument. Non-trace middleware headers are preserved as before.
-    supports_extra_headers = _RELAY_PROTOCOL_BY_API_MODE.get(_api_mode(metadata)) is not None or "extra_headers" in original
+    supports_extra_headers = (
+        (metadata or {}).get("transport_supports_extra_headers", True)
+        and (_RELAY_PROTOCOL_BY_API_MODE.get(_api_mode(metadata)) is not None or "extra_headers" in original)
+    )
     if headers and not supports_extra_headers:
         headers = {k: v for k, v in headers.items() if str(k).lower() != "traceparent"}
     if headers:
