@@ -1238,13 +1238,33 @@ def list_authenticated_providers(
         curated=_build_curated_lists(current_provider, current_base_url, current_model,
                                      non_blocking=non_blocking_catalogs))
 
+    # Disabled routes are never discovered/authenticated, even when explicitly visible.
+    # Their picker row is purely static; visibility does not grant runtime permission.
+    from hermes_cli.config import is_provider_enabled
+    from hermes_cli.model_switch import _declared_model_ids
+    from providers import get_provider_profile
+    for slug, cfg in user_providers.items():
+        if not isinstance(cfg, dict) or is_provider_enabled(cfg):
+            continue
+        if cfg.get("picker_visible") is True and slug.lower() not in b.excluded:
+            profile = get_provider_profile(slug)
+            models = _declared_model_ids(cfg.get("models")) or list(
+                profile.fallback_models if profile else ())
+            name = coerce_provider_id(cfg.get("name")) or (
+                profile.display_name if profile else slug)
+            b.results.append({
+                "slug": slug, "name": f"{name} — отключён", "is_current": False,
+                "is_user_defined": False, "models": _cap_models(models, max_models, slug),
+                "total_models": len(models), "source": "disabled-config", "disabled": True})
+        b.excluded.add(slug.lower())
+
     # Warm the disk cache in parallel before the serial section loops (otherwise 15-30s of live
     # round-trips on a cold cache). Skipped when refresh=True (serial path force-refreshes) and
     # for <=3 providers (serial is fast enough; avoids thread-pool overhead). The GUI read path
     # collects nothing either: every cache-only row read spawns its own deduped background refresh,
     # so no thread pool is joined and no probe can hold up the response.
     prefetch_slugs = ([] if (refresh or non_blocking_catalogs)
-                      else _collect_authed_provider_slugs(data, b.curated, excluded_providers or []))
+                      else _collect_authed_provider_slugs(data, b.curated, list(b.excluded)))
     if len(prefetch_slugs) > 3:
         try:
             _prefetch_provider_models_parallel(prefetch_slugs)
@@ -1277,8 +1297,9 @@ def _finalize_picker_rows(results: list, user_providers, current_model: str) -> 
             if disabled:
                 results = [
                     r for r in results
-                    if str(r.get("provider_id", "")).strip().lower() not in disabled
-                    and str(r.get("slug", "")).strip().lower() not in disabled]
+                    if r.get("source") == "disabled-config"
+                    or (str(r.get("provider_id", "")).strip().lower() not in disabled
+                        and str(r.get("slug", "")).strip().lower() not in disabled)]
     except Exception:
         pass
 
