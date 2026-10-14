@@ -15,6 +15,7 @@ import re
 import subprocess
 from pathlib import Path
 from urllib.parse import quote
+from hermes_cli.kanban_pr_acceptance_policy import PlanGatedRules, is_plan_gated, local_policy, review_verdict
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
@@ -40,6 +41,9 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
                                 text=True, encoding="utf-8", errors="replace", timeout=30,
                                 check=True, env=_gh_env(profile_home))
     except subprocess.CalledProcessError as exc:
+        if (re.fullmatch(r"repos/[^/]+/[^/]+/rules/branches/[^?]+(?:\?.*)?", endpoint)
+                and is_plan_gated(exc.stdout)):
+            raise PlanGatedRules(endpoint) from None
         # 401/403/404 = the login cannot see this repository (wrong profile identity
         # or missing grant), not a transient API failure. Persist only the status
         # code + endpoint, never gh's stderr (credentials/host details).
@@ -135,15 +139,24 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
-                     paginate=True, profile_home=profile_home)
+        policy = None
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                         paginate=True, profile_home=profile_home)
+        except PlanGatedRules:
+            policy = local_policy(repo)
+            if policy is None or protection:
+                raise ValueError("Plan-gated rules require an explicit valid local policy and no classic protection")
+            rules = []
+            required.update((c, None) for c in policy['required_contexts'])
+            receipt['policy'] = {'source': 'kanban.pr_acceptance.local_policies', 'repo': repo, **policy}
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
                     required.update((r["context"], r.get("integration_id"))
                                     for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
-        if not required:
+        if not required and policy is None:
             receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
             return receipt
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
@@ -172,11 +185,26 @@ def collect_acceptance(contract: str, published_pr: str | None,
                     "url": check.get("html_url") or check.get("target_url"),
                     "head_sha": check.get("head_sha", check.get("sha")),
                     "classification": classification, "conclusion": outcome})
-        # Re-read after all pages: old-head successes are never transferable.
+        comments = []
+        if policy is not None and policy['review_approve']:
+            comments = [c for page in _api(f"repos/{repo}/issues/{number}/comments?per_page=100",
+                         paginate=True, profile_home=profile_home) for c in page]
+        # Re-read after ALL evidence including reviews: old-head successes are never transferable.
         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
             receipt.update(classification="stale", detail="PR head/base changed while collecting evidence; retry.")
             return receipt
+        if policy is not None:
+            if policy['require_merged']:
+                merged = (current.get('merged') is True and current.get('state') == 'closed'
+                          and bool(re.fullmatch(r'[0-9a-f]{40}', current.get('merge_commit_sha') or '')))
+                outcomes.append('success' if merged else 'pending')
+                receipt['checks'].append({'name': 'merged', 'classification': outcomes[-1],
+                                         'head_sha': sha, 'merge_commit_sha': current.get('merge_commit_sha')})
+            if policy['review_approve']:
+                verdict, evidence = review_verdict(comments, sha, current['head']['ref'])
+                outcomes.append(verdict)
+                receipt['checks'].append(evidence)
         receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
         receipt["ok"] = receipt["classification"] == "success"
         return receipt

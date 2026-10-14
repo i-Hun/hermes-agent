@@ -405,7 +405,7 @@ _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
 _ATTACHMENT_FIELDS = tuple(
     "id filename content_type size uploaded_by stored_path created_at".split())
-_CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id")
+_CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id", "role")
 
 
 def _fields(obj: Any, names: tuple[str, ...]) -> dict[str, Any]:
@@ -1050,6 +1050,34 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
         state.close()
 
 
+def _dependency_gate(wait: list) -> dict[str, Any]:
+    """``{"gated": bool[, "gated_by": <parent id>]}`` for a create/lookup response.
+
+    ``dependency_wait`` events have two producers and only one of them names a
+    parent: the parent-gate write carries ``{"reason": "parent_not_done",
+    "parent": <id>}``, while a worker's own ``block(kind="dependency")`` and the
+    review-demote-on-parent-reopen write carry ``{"reason", "kind",
+    "source_status"}`` with no ``parent`` at all. Reading ``payload["parent"]``
+    off the newest event therefore raised ``KeyError`` for any card whose latest
+    dependency wait was one of those two — and because the gate is built AFTER
+    ``create_task`` returns, the failure surfaced as an error response even
+    though the idempotent re-create had already written the card's role. The
+    supported way to declare the role of an EXISTING lane is exactly that
+    re-create, so the response must report the gate, not crash.
+    """
+    gated_by = None
+    for event in reversed(wait or []):
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if payload.get("parent"):
+            gated_by = payload["parent"]
+            break
+    if not wait:
+        return {"gated": False}
+    # Waiting on a sibling, but no event names the parent (worker-declared
+    # dependency block / parent-reopen demote): still gated, just unnamed.
+    return {"gated": True, **({"gated_by": gated_by} if gated_by else {})}
+
+
 @_kanban_handler("kanban_create")
 def _handle_create(args: dict, **kw) -> str:
     """Create a (child) task; orchestrator workers use this to fan out."""
@@ -1104,11 +1132,12 @@ def _handle_create(args: dict, **kw) -> str:
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
+            role=args.get("role"),
             initial_status=str(args.get("initial_status") or "running"),
             created_by=_persisted_identity(), session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
-        gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
+        gate = _dependency_gate(wait)
         return _ok(task_id=new_tid, **landed, **gate,
                    subscribed=_maybe_auto_subscribe(conn, new_tid))
 

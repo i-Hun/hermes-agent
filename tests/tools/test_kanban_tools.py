@@ -683,6 +683,51 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_declares_role_on_a_lane_parked_by_a_dependency_block(worker_env):
+    """An idempotent re-create is the supported way to bring an EXISTING lane under the
+    explicit role contract (see ``create_task``). A lane parked by a worker's sibling
+    block writes a ``dependency_wait`` event with no ``parent`` key (the parent is an
+    input to the card, not a gate the event re-states). The create response must not
+    index ``payload["parent"]`` blindly: doing so raised ``KeyError`` AFTER the role had
+    already been written, so a successful declaration came back as an error.
+    """
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    key = "proj-review-PR-7#r1"
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="sibling fix", assignee="peer")  # stays open
+        lane = kb.create_task(conn, title="review lane", assignee="peer",
+                              idempotency_key=key)
+        assert kb.claim_task(conn, lane) is not None
+        assert kb.request_review(conn, lane, force=True) is True
+        kb.link_tasks(conn, parent, lane)          # the sibling is still open
+        # A review round cannot start while a parent is open: the demote writes a
+        # ``dependency_wait`` event that names NO parent, and it is the newest one.
+        assert kb.claim_review_task(conn, lane) is None
+        waits = [e for e in kb.list_events(conn, lane) if e.kind == "dependency_wait"]
+        assert waits and "parent" not in (waits[-1].payload or {}), waits[-1].payload
+    finally:
+        conn.close()
+
+    d = json.loads(kt._handle_create({
+        "title": "review lane", "assignee": "peer",
+        "idempotency_key": key, "role": "review",
+    }))
+    assert d.get("ok") is True, d
+    assert d["task_id"] == lane
+    assert d["role"] == "review"
+    assert d["gated"] is True  # still waiting on the sibling — just no parent named
+    conn = kbc.connect()
+    try:
+        landed_lane = kb.get_task(conn, lane)
+        assert landed_lane is not None and landed_lane.role == "review"
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])
 @pytest.mark.parametrize("target_scoped", [False, True])
 def test_create_explicit_scratch_ignores_ambient_board_project(

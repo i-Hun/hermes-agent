@@ -213,6 +213,11 @@ _SPECS = [
                   "review). Best for open-ended cards one shot rarely finishes."),
         _arg("--goal-max-turns", type=int, metavar="N", dest="goal_max_turns",
              help="Turn budget for --goal workers (default 20). Ignored without --goal."),
+        _arg("--role", choices=sorted(kb.VALID_TASK_ROLES),
+             help="Explicit card role. Use 'review' for a review/verdict lane: the "
+                  "PR URLs its thread quotes are the inputs to its rounds, so the "
+                  "dispatcher's active_pr respawn guard must never hold it. Omit "
+                  "for a normal implementation card (the default for every card)."),
         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
@@ -257,6 +262,13 @@ _SPECS = [
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+    _cmd("role", [
+        _TASK_ID,
+        _arg("role", nargs="?",
+             help="Explicit card role: implementation | review (or 'none' to clear). "
+                  "'review' declares a review/verdict lane whose PR references are "
+                  "inputs, so the dispatcher's active_pr respawn guard never applies."),
+    ], help="Declare a card's explicit role (implementation | review)"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,

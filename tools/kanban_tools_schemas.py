@@ -501,6 +501,18 @@ KANBAN_CREATE_SCHEMA = _schema(
             "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
             "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
         )),
+        "role": {
+            "type": "string",
+            "enum": ["implementation", "review"],
+            "description": (
+                "Explicit card role. 'review' declares a review/verdict lane: the "
+                "PR URLs its thread quotes are the INPUTS to its rounds, so the "
+                "dispatcher's active_pr respawn guard must never hold the card "
+                "(it used to freeze review lanes for hours between rounds). Omit "
+                "for a normal implementation card, which is the default for every "
+                "card."
+            ),
+        },
         "goal_max_turns": _prop("integer", (
                 "Turn budget for goal_mode workers. Caps how many "
                 "continuation turns the worker may take before the task "

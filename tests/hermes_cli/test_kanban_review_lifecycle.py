@@ -483,6 +483,323 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+@pytest.mark.parametrize("key", [
+    "vpvd-review-PR-162", "vpvd-review-PR-162#r2", "another-project-review-PR-42",
+])
+def test_external_review_round_not_guarded(kanban_home, monkeypatch, key):
+    """A ready review card must survive its own first-round PR verdict."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    with kbc.connect() as conn:
+        reviewer = kb.create_task(conn, title="round two", assignee="reviewer",
+                                  idempotency_key=key)
+        implementer = kb.create_task(conn, title="implementation", assignee="dev")
+        for tid in (reviewer, implementer):
+            kb.add_comment(conn, tid, author="reviewer", body=(
+                "REVIEW: REQUEST_CHANGES\n"
+                f"reviewer-card: {reviewer}\n"
+                "https://github.com/i-Hun/vpvd/pull/162#issuecomment-123"))
+        spawned = []
+
+        def spawn(task, workspace_path, board=None):
+            spawned.append(task.id)
+            return os.getpid()
+
+        preview = kbd.dispatch_once(conn, dry_run=True)
+        assert reviewer in [s[0] for s in preview.spawned]
+        assert dict(preview.respawn_guarded).get(implementer) == "active_pr"
+        result = kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert spawned == [reviewer]
+        claimed = kb.get_task(conn, reviewer)
+        assert claimed is not None and claimed.status == "running"
+        assert reviewer in [s[0] for s in result.spawned]
+        assert dict(result.respawn_guarded).get(implementer) == "active_pr"
+        again = kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert spawned == [reviewer]
+        assert reviewer not in [s[0] for s in again.spawned]
+        # A later verdict in the same lane must not reintroduce the guard.
+        kb.add_comment(conn, reviewer, author="reviewer",
+                       body="https://github.com/i-Hun/vpvd/pull/162 round 2")
+        assert kbd.check_respawn_guard(conn, reviewer) is None
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET last_failure_error = 'unauthorized' WHERE id = ?",
+                         (reviewer,))
+        assert kbd.check_respawn_guard(conn, reviewer) == "blocker_auth"
+
+
+@pytest.mark.parametrize("key", [None, "vpvd-review-PR-162-extra", "vpvd-review-PR-x",
+                                      "vpvd-review-PR-162#r2junk", "vpvd-review-PR-162#r0"])
+def test_review_marker_lookalikes_remain_guarded(kanban_home, key):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="REVIEW: REQUEST_CHANGES", assignee="dev",
+                             idempotency_key=key)
+        kb.add_comment(conn, tid, author="dev", body=(
+            f"reviewer-card: {tid}\nhttps://github.com/i-Hun/vpvd/pull/162"))
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+@pytest.mark.parametrize("outcome,reason", [
+    ("rate_limited", "rate_limit_cooldown"),
+    ("completed", "recent_success"),
+])
+def test_external_review_key_preserves_other_guards(kanban_home, outcome, reason):
+    import time
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="review", assignee="reviewer",
+                             idempotency_key="another-project-review-PR-42")
+        now = int(time.time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at) "
+                "VALUES (?, 'reviewer', ?, ?, ?, ?)", (tid, outcome, outcome, now, now + 1),
+            )
+        assert kbd.check_respawn_guard(conn, tid) == reason
+
+
+# ---------------------------------------------------------------------------
+# Explicit card ROLE (``role="review"``) — the contract that replaces guessing
+# the lane from the idempotency-key spelling.
+#
+# Incident t_d462c34d (12.10.2026): a genuine independent review lane for a
+# tooling PR was created with the ad-hoc key ``vpvd-admin4402-tooling-review``,
+# which does NOT have the ``<project>-review-PR-<n>`` form. Its own worker had
+# quoted the PR URL in the thread, so the guard held it in ``ready`` for ~30
+# minutes — one ``respawn_guarded {reason: active_pr}`` every minute — and the
+# card only started after a workaround ``reassign none -> vox``. The lane cannot
+# be recognised from the key, the title or the URL: it must be DECLARED.
+# ---------------------------------------------------------------------------
+
+
+def _pr_verdict_comment(conn, tid, *, number=187, author="reviewer"):
+    kb.add_comment(conn, tid, author=author, body=(
+        "REVIEW: REQUEST_CHANGES\n"
+        f"reviewer-card: {tid}\n"
+        f"https://github.com/i-Hun/vpvd/pull/{number}#issuecomment-6126931153"))
+
+
+@pytest.mark.parametrize("declared", ["review", "REVIEW", " review "])
+def test_declared_review_role_starts_with_its_own_pr_url(kanban_home, monkeypatch, declared):
+    """GREEN for the incident: a declared review lane survives its own verdict.
+
+    Same card as the RED case below — the only difference is the declared role,
+    which is exactly what the fix adds. The lane must be spawned by a real
+    dispatch tick (no reassign, no key convention), must not be spawned twice
+    while its claim is active, and a later verdict in the same lane must not
+    reintroduce the guard.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    with kbc.connect() as conn:
+        lane = kb.create_task(conn, title="vpvd tooling: независимая review lane",
+                              assignee="reviewer", role=declared,
+                              idempotency_key="vpvd-admin4402-tooling-review")
+        _pr_verdict_comment(conn, lane)
+        assert kbd.check_respawn_guard(conn, lane) is None
+
+        spawned = []
+
+        def spawn(task, workspace_path, board=None):
+            spawned.append(task.id)
+            return os.getpid()
+
+        preview = kbd.dispatch_once(conn, dry_run=True)
+        assert lane in [s[0] for s in preview.spawned]
+        assert dict(preview.respawn_guarded).get(lane) is None
+
+        result = kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert spawned == [lane]
+        assert lane in [s[0] for s in result.spawned]
+        claimed = kb.get_task(conn, lane)
+        assert claimed is not None and claimed.status == "running"
+
+        # An active claim must not produce a second worker for the same lane.
+        again = kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert spawned == [lane]
+        assert lane not in [s[0] for s in again.spawned]
+
+        # A later round's verdict in the SAME lane is still an input, not a
+        # duplicate implementation.
+        _pr_verdict_comment(conn, lane, number=187)
+        assert kbd.check_respawn_guard(conn, lane) is None
+
+
+@pytest.mark.parametrize("role", [None, "implementation"])
+def test_undeclared_card_with_the_same_pr_url_stays_guarded(kanban_home, monkeypatch, role):
+    """RED control: without the declaration the guard still protects."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="vpvd tooling: независимая review lane",
+                             assignee="reviewer", role=role,
+                             idempotency_key="vpvd-admin4402-tooling-review")
+        _pr_verdict_comment(conn, tid)
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert tid not in [s[0] for s in res.spawned]
+        assert dict(res.respawn_guarded).get(tid) == "active_pr"
+
+
+@pytest.mark.parametrize("outcome,expected", [
+    ("rate_limited", "rate_limit_cooldown"),
+])
+def test_review_role_keeps_cooldown_guard(kanban_home, outcome, expected):
+    """Only ``active_pr`` is skipped for a declared lane: pacing guards stay."""
+    import time
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="declared review lane", assignee="reviewer",
+                             role="review")
+        _pr_verdict_comment(conn, tid)
+        now = int(time.time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at) "
+                "VALUES (?, 'reviewer', ?, ?, ?, ?)", (tid, outcome, outcome, now, now + 1),
+            )
+        assert kbd.check_respawn_guard(conn, tid) == expected
+
+
+def test_review_role_keeps_auth_guard(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="declared review lane", assignee="reviewer",
+                             role="review")
+        _pr_verdict_comment(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET last_failure_error = 'unauthorized' WHERE id = ?",
+                         (tid,))
+        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
+
+
+def test_review_role_keeps_recent_success_pacing(kanban_home):
+    """A completed round still paces the next one (only active_pr is skipped)."""
+    import time
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="declared review lane", assignee="reviewer",
+                             role="review")
+        now = int(time.time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at) "
+                "VALUES (?, 'reviewer', 'completed', 'completed', ?, ?)", (tid, now, now + 1),
+            )
+        assert kbd.check_respawn_guard(conn, tid) == "recent_success"
+
+
+def test_review_role_keeps_dependency_and_blocked_gates(kanban_home, monkeypatch):
+    """The declared role is not a dispatcher bypass: parents/blocks still hold."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="author card", assignee="dev")
+        lane = kb.create_task(conn, title="review card", assignee="reviewer",
+                              role="review", parents=[parent])
+        _pr_verdict_comment(conn, lane)
+        # Unfinished parent -> todo, never spawned, even though the role
+        # exempts the card from active_pr.
+        assert kb.get_task(conn, lane).status == "todo"
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert lane not in [s[0] for s in res.spawned]
+
+        # Blocked card stays blocked.
+        blocked = kb.create_task(conn, title="blocked review card", assignee="reviewer",
+                                 role="review")
+        kb.block_task(conn, blocked, reason="needs a human", kind="needs_input")
+        res2 = kbd.dispatch_once(conn, dry_run=True)
+        assert blocked not in [s[0] for s in res2.spawned]
+
+
+def test_unknown_role_is_refused_and_role_can_be_cleared(kanban_home):
+    """A typo fails closed: no declared role, no exemption."""
+    with kbc.connect() as conn:
+        with pytest.raises(ValueError):
+            kb.create_task(conn, title="typo", assignee="dev", role="reviewer")
+        tid = kb.create_task(conn, title="lane", assignee="reviewer", role="review")
+        assert kb.get_task(conn, tid).role == "review"
+        assert kb.set_task_role(conn, tid, None) is True
+        assert kb.get_task(conn, tid).role is None
+        assert kbd.check_respawn_guard(conn, tid) is None  # no PR comment yet
+        _pr_verdict_comment(conn, tid)
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+        assert kb.set_task_role(conn, tid, "review") is True
+        assert kbd.check_respawn_guard(conn, tid) is None
+        with pytest.raises(ValueError):
+            kb.set_task_role(conn, tid, "nonsense")
+        assert kb.set_task_role(conn, "t_missing", "review") is False
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert kinds.count("role_changed") == 2
+
+
+def test_role_is_recorded_at_creation_and_visible_on_the_task(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="lane", assignee="reviewer", role="review")
+        created = [e for e in kb.list_events(conn, tid) if e.kind == "created"]
+        assert created and created[0].payload.get("role") == "review"
+        assert kb.get_task(conn, tid).role == "review"
+
+
+def test_repeat_create_on_the_lane_key_converges_the_declared_role(kanban_home):
+    """An EXISTING lane reaches the explicit contract by re-declaring its role.
+
+    The fleet's lanes are one persistent card per PR/MR, reused across rounds,
+    created through the same idempotency key every time. A lane created before
+    the column existed is therefore marked by repeating that call with an
+    explicit role — per card, no bulk migration, no reassign, and no rule that
+    would release somebody else's queued work.
+    """
+    key = "vpvd-admin4402-tooling-review"
+    with kbc.connect() as conn:
+        lane = kb.create_task(conn, title="lane", assignee="reviewer", idempotency_key=key)
+        assert kb.get_task(conn, lane).role is None
+
+        again = kb.create_task(conn, title="lane", assignee="reviewer",
+                               idempotency_key=key, role="review")
+        assert again == lane
+        assert kb.get_task(conn, lane).role == "review"
+
+        # A repeat call that declares nothing changes nothing.
+        assert kb.create_task(conn, title="lane", assignee="reviewer",
+                              idempotency_key=key) == lane
+        assert kb.get_task(conn, lane).role == "review"
+
+        # And the lane's own PR verdict is now an input, not duplicate work.
+        _pr_verdict_comment(conn, lane)
+        assert kbd.check_respawn_guard(conn, lane) is None
+
+
+@pytest.mark.parametrize("raw", ["Review", " review ", "REVIEW"])
+def test_raw_role_spelling_still_declares_the_lane(kanban_home, raw):
+    """A row written by raw SQL still counts, and an unknown value fails closed.
+
+    ``is_review_role`` normalises case and surrounding whitespace so a value
+    that never went through ``normalize_task_role`` (direct SQL, an out-of-tree
+    writer, a hand-fixed board) still declares the lane instead of silently
+    losing the exemption. Anything else is NOT a review lane.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="lane", assignee="reviewer")
+        _pr_verdict_comment(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET role = ? WHERE id = ?", (raw, tid))
+        assert kbd.check_respawn_guard(conn, tid) is None
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET role = 'reviewer' WHERE id = ?", (tid,))
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
 def _backdate_comments(conn, tid, seconds=60):
     """Second-granularity timestamps: make the PR comment older than the
     handoff that follows it in the same test."""

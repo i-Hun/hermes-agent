@@ -1539,12 +1539,17 @@ def check_respawn_guard(
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
     handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
-    handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
-    passes own those.
+    PR). The native review lane skips the last two: they are the *inputs* to a
+    review handoff, and so does a card that DECLARES ``role='review'``
+    (``kanban_db.VALID_TASK_ROLES``) while running in ``ready`` — an external
+    review lane's thread quotes the PR it reviews by construction, so
+    ``active_pr`` would freeze it between rounds. Only ``active_pr`` is skipped
+    for a declared review role: auth, cooldown and ``recent_success`` still
+    pace repeat rounds. Stale / dead claim locks are NOT a guard reason — the
+    reclaim passes own those.
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, idempotency_key, role FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -1618,6 +1623,27 @@ def check_respawn_guard(
         ).fetchone()
         if not requeued_after:
             return "recent_success"
+
+    # External review lanes run in ready, not necessarily in the native review
+    # column, and their thread quotes the PR under review by construction. A
+    # DECLARED review lane (``role='review'``, see ``kanban_db.VALID_TASK_ROLES``)
+    # therefore never takes its own PR guard: a PR verdict URL is the input to
+    # the next round, not publication of a duplicate implementation. Role is an
+    # explicit field, never inferred — the naming convention below is kept only
+    # as the compatibility path for lanes created before the field existed.
+    if _kb.is_review_role(row["role"]):
+        return None
+
+    # Compatibility path for review lanes created before ``role``: their stable
+    # <project>-review-PR-<number>[#r<number>] key declares review work.
+    # Never infer this role from comment prose: implementers also quote
+    # REQUEST_CHANGES and reviewer-card markers.
+    review_key = row["idempotency_key"]
+    if review_key and re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_.-]*-review-PR-[1-9][0-9]*(?:#r[1-9][0-9]*)?",
+        review_key,
+    ):
+        return None
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     #    Exception: a handoff AFTER the newest PR comment (operator reassign,

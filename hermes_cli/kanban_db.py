@@ -111,6 +111,41 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Explicit card roles. The dispatcher's respawn guard needs to know whether a
+# PR URL in the card's thread is this card's own work product (re-spawning it
+# would duplicate that work) or an INPUT to the card (a review lane quoting the
+# PR it reviews — exactly the case the guard used to freeze for hours, because
+# an open PR never stops being "recent"). Role is declared, never inferred from
+# titles, URLs or key spelling: a naming convention that the fleet's own ad-hoc
+# review lanes did not follow is what produced the incident, so the field is the
+# contract and an unknown value is refused rather than guessed.
+#
+#   * ``"implementation"`` — the card owns what it publishes (default).
+#   * ``"review"`` — a review/verdict lane (``active_pr`` does not apply).
+# ``None``/``""`` = unset = ``"implementation"`` (every pre-column row).
+VALID_TASK_ROLES = ("implementation", "review")
+
+
+def normalize_task_role(role: Optional[str]) -> Optional[str]:
+    """``VALID_TASK_ROLES`` entry, or ``None`` for unset; case-insensitive.
+
+    Anything else raises: a typo must fail closed (unset ⇒ guarded), not buy an
+    exemption from duplicate-work protection.
+    """
+    value = str(role or "").strip().lower()
+    if not value:
+        return None
+    if value not in VALID_TASK_ROLES:
+        raise ValueError(
+            f"role must be one of {list(VALID_TASK_ROLES)} (or empty), got {role!r}"
+        )
+    return value
+
+
+def is_review_role(role: Optional[str]) -> bool:
+    """True when ``role`` declares a review lane (``"review"``, any case)."""
+    return str(role or "").strip().lower() == "review"
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """``VALID_REASONING_EFFORTS`` or ``"none"`` (thinking off), case-insensitive;
@@ -738,6 +773,8 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Explicit card role (VALID_TASK_ROLES); None/"" = unset = "implementation".
+    role: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -767,7 +804,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "role",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -972,7 +1009,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Explicit card role (VALID_TASK_ROLES). 'review' marks a review/verdict
+    -- lane: the PR URLs its thread quotes are the INPUTS to its rounds, not a
+    -- work product, so the respawn guard's active_pr branch is skipped for it.
+    -- NULL/'' = unset = 'implementation' — what every row created before this
+    -- column existed means.
+    role                 TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1266,6 +1309,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    role: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1281,11 +1325,16 @@ def create_task(
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
+    ``role``: explicit card role (``VALID_TASK_ROLES``) — ``"review"`` declares a
+    review/verdict lane, whose PR references are inputs rather than a work
+    product, so the dispatcher's respawn guard does not treat an open PR in its
+    thread as duplicate work. Unset = ``"implementation"``.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
+    role = normalize_task_role(role)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
@@ -1329,6 +1378,14 @@ def create_task(
             "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
         ).fetchone()
         if row:
+            # A lane key is persistent by design (one card per PR/MR, reused
+            # across rounds), so an explicit role in a repeat call is a
+            # re-declaration of that same lane and must converge instead of
+            # being dropped — that is how a lane created before the column
+            # existed reaches the explicit contract without a bulk migration.
+            # Omitted role (None) changes nothing, as before.
+            if role is not None:
+                set_task_role(conn, row["id"], role)
             return row["id"]
 
     now = int(time.time())
@@ -1365,8 +1422,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract, role
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1376,6 +1433,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        role,
                     ),
                 )
                 for pid in parents:
@@ -1398,6 +1456,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "role": role,
                     },
                 )
                 if task_status == "blocked":
@@ -1463,7 +1522,7 @@ def _inherit_notify_subs(
     conn: sqlite3.Connection, child_id: str, parents: Iterable[str], *,
     created_at: Optional[int] = None,
 ) -> None:
-    """Copy parents' notify subscriptions to a child, cursor caught up to the
+    """Copy the parents' subscriptions to a child, cursor caught up to the
     child's current event so a late ``link_tasks`` never replays history.
 
     Single owner of inheritance (create_task, link_tasks, decompose). It must
@@ -1472,6 +1531,18 @@ def _inherit_notify_subs(
 
     Omitting columns here silently degrades routing: a DM-originated child completion falls back to
     chat_type='group' and wakes a fresh group-scoped session instead of the originating DM (issue #73030).
+
+    Ownership is the second half of the contract. A subscription's
+    ``notifier_profile`` names the profile that owns and delivers that route, so
+    a parent's route belongs to the PARENT's owner — not to the child, which
+    belongs to its own ``assignee``. Copying a foreign route onto the child
+    subscribes a stranger's chat to this card, and because the auto-subscribe
+    path skips a task that already holds ANY subscription, the copy also costs
+    the child its own route: the assignee's completion is then delivered to
+    whoever ordered the work and the assignee is never told. Only rows with no
+    owner (legacy rows claimed by the dispatching owner) and rows owned by the
+    child's ``assignee`` are inherited; a card with no assignee inherits
+    everything, as before.
     """
     parent_ids = tuple(dict.fromkeys(p for p in parents if p))
     if not parent_ids:
@@ -1481,6 +1552,17 @@ def _inherit_notify_subs(
     ).fetchone()
     cursor = int(row["cursor"] if row is not None else 0)
     placeholders = ",".join("?" * len(parent_ids))
+    child_row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (child_id,),
+    ).fetchone()
+    owner = (child_row["assignee"] if child_row is not None else None) or None
+    owner_where, owner_params = "", ()
+    if owner:
+        owner_where = (
+            " AND (notifier_profile IS NULL OR notifier_profile = ''"
+            " OR notifier_profile = ?)"
+        )
+        owner_params = (owner,)
     conn.execute(
         f"""
         INSERT OR IGNORE INTO kanban_notify_subs
@@ -1491,9 +1573,12 @@ def _inherit_notify_subs(
                COALESCE(chat_type, 'dm'), notifier_profile,
                COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
           FROM kanban_notify_subs
-         WHERE task_id IN ({placeholders})
+         WHERE task_id IN ({placeholders}){owner_where}
         """,
-        (child_id, int(created_at if created_at is not None else time.time()), cursor, *parent_ids),
+        (
+            child_id, int(created_at if created_at is not None else time.time()), cursor,
+            *parent_ids, *owner_params,
+        ),
     )
 
 
@@ -2615,6 +2700,29 @@ def reassign_task(
         # Task is still running and reclaim_first was False; caller
         # needs to decide whether to retry with reclaim.
         return False
+
+
+def set_task_role(conn: sqlite3.Connection, task_id: str, role: Optional[str]) -> bool:
+    """Declare (or clear, with ``None``/``""``) a card's explicit role.
+
+    See ``VALID_TASK_ROLES``. This is the supported way to bring an EXISTING
+    card — created before the column existed, or by a creator that declared
+    nothing — under the explicit contract. It is deliberately per-card: there is
+    no bulk rule and no mass unfreeze, so declaring one lane cannot release
+    somebody else's queued work. Returns False for an unknown task id; raises
+    ``ValueError`` for an unknown role.
+    """
+    normalized = normalize_task_role(role)
+    with write_txn(conn):
+        row = conn.execute("SELECT role FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False
+        previous = _lossy_text(row["role"]) or None
+        if previous == normalized:
+            return True
+        conn.execute("UPDATE tasks SET role = ? WHERE id = ?", (normalized, task_id))
+        _append_event(conn, task_id, "role_changed", {"from": previous, "to": normalized})
+    return True
 
 
 def _verify_created_cards(

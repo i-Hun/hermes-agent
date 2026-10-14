@@ -160,6 +160,10 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    # Explicit card role: added by migration on a board that predates it, so a
+    # legacy row reads ``role = NULL`` (= unset = implementation) rather than
+    # breaking the SELECT.
+    assert "role" in task_columns
     assert "run_id" in event_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
