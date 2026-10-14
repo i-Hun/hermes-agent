@@ -5030,6 +5030,20 @@ def _resolve_openai_codex_branch(req: _ResolveRequest) -> _ResolveResult:
                        "model; pass model explicitly (e.g. model.model in config.yaml "
                        "or auxiliary.<task>.model for per-task aux routing).")
         return None, None
+    # The running session already resolved a working credential AND its authority.
+    # Re-selecting the profile pool here can discard that route (expired singleton,
+    # exhausted pool) and silently send compression to a different, smaller model.
+    # Never pair one explicit override with a credential/endpoint from another source.
+    if req.explicit_api_key and req.explicit_base_url:
+        raw_client = _create_openai_client(
+            api_key=req.explicit_api_key, base_url=req.explicit_base_url,
+            default_headers=_codex_cloudflare_headers(
+                req.explicit_api_key if isinstance(req.explicit_api_key, str) else "",
+                base_url=req.explicit_base_url,
+            ),
+        )
+        client = raw_client if req.raw_codex else CodexAuxiliaryClient(raw_client, model)
+        return _route_client(req, client, model)
     no_token_msg = "resolve_provider_client: openai-codex requested but no Codex OAuth token found (run: hermes model)"
     if req.raw_codex:
         # Raw OpenAI client for callers needing responses.stream() (main agent loop).
