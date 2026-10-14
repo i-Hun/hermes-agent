@@ -929,6 +929,15 @@ def managed_callback_guard():
         _MANAGED_CALLBACK_DEPTH.reset(token)
 
 
+def managed_callback_active() -> bool:
+    """Whether this context still owes a managed Relay callback its return.
+
+    Subscriber flush barriers wait for that callback's terminal publication,
+    so nested work (including copied-context children) must not wait on them.
+    """
+    return _MANAGED_CALLBACK_DEPTH.get() > 0
+
+
 def _warn_on_error(what: str, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     """Run fail-open telemetry work: log ``Hermes Relay <what> failed`` and return None on error."""
     try:

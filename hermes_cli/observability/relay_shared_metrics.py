@@ -566,16 +566,7 @@ class _Runtime:
         ):
             return
         self._emit_session_summary(session)
-        try:
-            self.relay.subscribers.flush()
-        except Exception as exc:
-            logger.warning(
-                "Hermes shared-metrics session %s closed with errors: subscriber flush failed: %s",
-                session.session_id,
-                exc,
-            )
-        else:
-            self._export()
+        self._flush_and_export("Hermes shared-metrics session flush failed")
         with self._sessions_lock:
             _forget(self._sessions, session.session_id, session)
 
@@ -672,6 +663,11 @@ class _Runtime:
 
     def _flush_and_export(self, failure_message: str) -> None:
         """Flush the Relay subscriber, then export; a failed flush skips the export."""
+        # A delegated child owes the outer managed tool its return. Relay's
+        # global barrier includes that tool, so waiting here deadlocks both.
+        # Events remain queued for the outer task's flush (or shutdown).
+        if relay_runtime.managed_callback_active():
+            return
         try:
             self.relay.subscribers.flush()
         except Exception:

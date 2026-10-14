@@ -1579,9 +1579,15 @@ def describe_invalid_response(agent: Any, response: Any, api_duration: float) ->
     if provider_name == "Unknown" and response and hasattr(response, 'model') and response.model:
         provider_name = f"model={response.model}"
 
-    if provider_name == "Unknown" and response:
-        resp_attrs = {k: str(v)[:100] for k, v in vars(response).items() if not k.startswith('_')}
+    if provider_name == "Unknown" and response is not None:
+        try:
+            attrs = vars(response)
+        except TypeError:
+            attrs = {}
+            if error_msg == "Unknown":
+                error_msg = f"Invalid response type: {type(response).__name__}"
         if agent.verbose_logging:
+            resp_attrs = {k: str(v)[:100] for k, v in attrs.items() if not k.startswith('_')}
             logging.debug(f"Response attributes for invalid response: {resp_attrs}")
 
     _resp_error_code = None
