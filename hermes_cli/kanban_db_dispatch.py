@@ -560,6 +560,128 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
         reaped.append(row["task_id"])
 
 
+# ``hermes-worker-kanban-<task>-run-<run>.scope`` — the transient scope
+# :func:`_worker_spawn_argv` wraps every systemd-hosted worker in.
+_WORKER_SCOPE_UNIT_RE = re.compile(r"^hermes-worker-kanban-(?P<task>.+)-run-(?P<run>\d+)\.scope$")
+_WORKER_SCOPE_SYSTEMCTL_TIMEOUT = 10
+# Each stop is a blocking ``systemctl`` call (up to its own timeout): bound the
+# work one tick does; any remainder is picked up on the next tick.
+_WORKER_SCOPE_MAX_STOPS_PER_TICK = 4
+
+
+def _systemctl_user(*args: str) -> Optional[str]:
+    """stdout of ``systemctl --user <args>``, or None when systemd / the user
+    bus is unreachable or the call fails — the caller then does nothing."""
+    from tools.process_registry import _IS_LINUX, systemd_user_bus_env
+
+    if not _IS_LINUX:
+        return None
+    import shutil
+
+    binary = shutil.which("systemctl")
+    if binary is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [binary, "--user", *args], capture_output=True, text=True,
+            timeout=_WORKER_SCOPE_SYSTEMCTL_TIMEOUT, stdin=subprocess.DEVNULL,
+            env=systemd_user_bus_env(), check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _list_worker_scope_units() -> list[str]:
+    """Names of the live Kanban worker scopes on this host's user manager."""
+    out = _systemctl_user("list-units", "--plain", "--no-legend", "--type=scope",
+                          "hermes-worker-kanban-*-run-*.scope")
+    if not out:
+        return []
+    return [fields[0] for fields in (line.split() for line in out.splitlines()) if fields]
+
+
+def _worker_scope_tasks_current(unit: str) -> Optional[int]:
+    out = _systemctl_user("show", "-p", "TasksCurrent", "--value", unit)
+    try:
+        return int(out.strip()) if out else None
+    except ValueError:
+        return None  # "[not set]" when task accounting is off
+
+
+def _stop_worker_scope(unit: str) -> bool:
+    from tools.process_registry import _stop_systemd_unit
+
+    return _stop_systemd_unit(unit)
+
+
+def _in_own_cgroup(unit: str) -> bool:
+    """True when this process itself lives in *unit* — never stop our own scope."""
+    try:
+        lines = Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    return any(unit in line.rpartition(":")[2].split("/") for line in lines)
+
+
+def reap_terminal_worker_scopes(conn: sqlite3.Connection) -> list[str]:
+    """Stop the whole systemd scope of a run that is already closed.
+
+    :func:`reap_terminal_workers` only follows the run's main pid. A worker that
+    backgrounded children (dev servers, build daemons, shell ``&`` jobs) exits,
+    but those children keep ``hermes-worker-kanban-<task>-run-<run>.scope``
+    alive — and its memory — indefinitely, and once the pid evidence is cleared
+    nothing ever looks at the run again. Every tick this lists the live worker
+    scopes and ``systemctl --user stop``s (whole cgroup) each one whose run row
+    exists, belongs to the same task, was claimed from this host and ended at
+    least ``TERMINAL_WORKER_REAP_GRACE_SECONDS`` ago. An open run, a unit
+    without a matching row, or another host's run is never touched. Without a
+    reachable user systemd this is a no-op. Returns the task ids reaped."""
+    try:
+        units = _list_worker_scope_units()
+    except Exception:
+        _kb._log.debug("kanban dispatch: listing worker scopes failed", exc_info=True)
+        return []
+    if not units:
+        return []
+    cutoff = int(time.time()) - TERMINAL_WORKER_REAP_GRACE_SECONDS
+    host_prefix = _kb._host_prefix()
+    reaped: list[str] = []
+    attempts = 0
+    for unit in units:
+        if attempts >= _WORKER_SCOPE_MAX_STOPS_PER_TICK:
+            break
+        try:
+            match = _WORKER_SCOPE_UNIT_RE.match(unit)
+            if match is None or _in_own_cgroup(unit):
+                continue
+            row = conn.execute(
+                "SELECT id, task_id, ended_at, claim_lock FROM task_runs WHERE id = ?",
+                (int(match["run"]),),
+            ).fetchone()
+            # Unit names carry no board slug and every board numbers its runs
+            # independently: the task-id match is what keeps one board's tick
+            # from stopping another board's scope that shares a run id.
+            if (row is None or row["task_id"] != match["task"] or row["ended_at"] is None
+                    or row["ended_at"] > cutoff
+                    or not str(row["claim_lock"] or "").startswith(host_prefix)):
+                continue
+            attempts += 1
+            tasks_current = _worker_scope_tasks_current(unit)
+            if not _stop_worker_scope(unit):
+                continue  # retried next tick
+            with _kb.write_txn(conn):
+                _kb._append_event(
+                    conn, row["task_id"], "terminal_worker_reaped",
+                    {"unit": unit, "tasks_current": tasks_current, "scope_stopped": True},
+                    run_id=row["id"],
+                )
+            reaped.append(row["task_id"])
+        except Exception:
+            _kb._log.debug("kanban dispatch: stopping worker scope %s failed", unit, exc_info=True)
+    return reaped
+
+
 def _worker_survived_termination(termination: dict) -> bool:
     """True when we tried to kill our own host-local worker and it is still alive.
 
@@ -2215,6 +2337,9 @@ def _run_reclaim_phase(
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
+    for task_id in reap_terminal_worker_scopes(conn):
+        if task_id not in result.reaped_terminal_workers:
+            result.reaped_terminal_workers.append(task_id)
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
