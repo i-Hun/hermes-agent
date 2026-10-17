@@ -22,6 +22,7 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
+from hermes_cli import kanban_workflow
 from hermes_cli.kanban_output import (
     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err,
     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
@@ -31,7 +32,7 @@ from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
-from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
+from hermes_cli.kanban_parser import build_parser
 
 
 # --- Flag parsing helpers ---
@@ -427,6 +428,9 @@ def _cmd_list(args: argparse.Namespace) -> int:
             include_archived=args.archived, order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id, current_step_key=args.current_step_key,
         )
+        # How long each running card has held its dispatch slot, measured from the
+        # ACTIVE run (a retry must not inherit the first attempt's age).
+        slot_since = kb.running_slot_since(conn) if any(t.status == "running" for t in tasks) else {}
     if _json_out(args, [_task_to_dict(t) for t in tasks]):
         return 0
     # Passive discoverability: only multi-board users see which board this is.
@@ -441,8 +445,19 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if not tasks:
         print("(no matching tasks)")
         return 0
+    now = int(time.time())
+    # Resolved once: the cap class depends only on the card's contract, and the
+    # defaults come from config (``kanban.default_max_runtime_seconds`` etc.).
+    defaults = kb.max_runtime_defaults() if slot_since else (None, None)
     for t in tasks:
-        print(_fmt_task_line(t))
+        since = slot_since.get(t.id) if t.status == "running" else None
+        if since is None:
+            print(_fmt_task_line(t))
+            continue
+        limit, _source = kb.resolve_max_runtime_seconds(
+            t.max_runtime_seconds, t.completion_contract, defaults=defaults,
+        )
+        print(_fmt_task_line(t, slot_seconds=now - since, limit_seconds=limit))
     return 0
 
 
@@ -1139,7 +1154,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     if _json_out(args, stats):
         return 0
     print("By status:")
-    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+    for k in kanban_workflow.DEFAULT_WORKFLOW.keys():
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")
