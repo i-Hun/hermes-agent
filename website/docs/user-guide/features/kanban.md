@@ -1012,6 +1012,10 @@ All commands are also available as a slash command in the interactive CLI and in
 |------------|---------|--------------|
 | `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
 | `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
+| `kanban.default_max_runtime_seconds` | `5400` (90 min) | Wall-clock cap per run for a card that sets no `max_runtime_seconds` of its own — otherwise such a card runs forever on a live heartbeat and pins its dispatch slot. `0` disables the default (explicit per-card caps still apply). The run closes `timed_out` with `limit_source: default`. |
+| `kanban.ci_max_runtime_seconds` | `9000` (150 min) | Same cap for a card whose `completion_contract` publishes a PR (anything but `local-only`): it honestly waits on remote checks. `limit_source: default_ci`. |
+| `kanban.preempt_priority_margin` | `20` | A `ready` card this far above a **running** card may take its slot — after `kanban.preempt_min_runtime_seconds`. `0` turns preemption off. |
+| `kanban.preempt_min_runtime_seconds` | `5400` (90 min) | A run shorter than this is never interrupted. |
 | `kanban.dispatch_profiles` | unset (any existing profile) | Per-home claim allowlist for boards shared across Hermes homes. When the key is present, this home's dispatcher only claims cards whose assignee is listed — fail-closed: an empty list, `null` or a bare `dispatch_profiles:` claims nothing, and a config read that fails logs a warning and claims nothing; other assignees land in `skipped_nonspawnable`. Only omitting the key means "any existing profile". `hermes kanban diagnostics` prints the resolved value for this home (`any`, the listed names, or `none (fail-closed: …)`). See [Shared boards across homes](#shared-boards-across-homes). |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
@@ -1039,6 +1043,67 @@ The dispatcher refuses to re-spawn a ready task when it hit a quota/auth/429 err
 To see why a ready card is not spawning, run `hermes kanban dispatch --dry-run` — the output lists `Guarded (<reason>): <task id>` per held card (and `respawn_guarded`, `rate_limited`, `skipped_locked`, `memory_pressure` with `--json`). The gateway's and the standalone daemon's "dispatcher stuck" warning also names what the last tick held back, e.g. `Last tick held back: active_pr=1`.
 
 `recent_success` and `active_pr` hold the **ready** lane only — they are the inputs to a review handoff, not signals against one. To have a reviewer, closer or other recovery profile pick up a card whose PR is already open, either move it to the review lane with `hermes kanban request-review <id>` (accepted from `ready` as well as `running`; the review-lane spawn is not subject to either guard) or hand the ready card to that profile with `hermes kanban assign <id> <profile>`: a handoff recorded *after* the PR comment — an operator reassign, a reviewer's changes-requested verdict, or a review reopen — lifts `active_pr` for the profile now named on the card, because that PR is exactly what it must work on. Only a change to a *different* profile counts: re-assigning the same profile, unassigning, or the dispatcher's own `kanban.default_assignee` fill-in does not lift the guard, so the assignee that opened the PR is still not re-spawned against it after a crash, reclaim or no-op reassign, and a newer PR comment posted after the handoff guards again. A deliberate re-queue after a success (drag `done→ready`, `unblock`, re-promotion) also lifts `recent_success`, so a manual re-run is never silently held for the whole window.
+
+### Priority preemption {#priority-preemption}
+
+A slot is the scarcest thing on a busy board: with four slots, one slow card pins a
+quarter of all throughput. The dispatcher therefore reclaims not only *wedged* runs but
+also **lower-priority** ones when real work is waiting:
+
+* every dispatch slot is taken (`max_spawn` / `max_in_progress` saturated — a free slot
+  means nothing has to be taken away, and an uncapped board has no scarcity to arbitrate),
+  **and**
+* a `ready` card sits at least `kanban.preempt_priority_margin` (default `20`) priority
+  points above a card that is `running`, **and**
+* that run has already lasted `kanban.preempt_min_runtime_seconds` (default `90` min), **and**
+* the higher card would actually spawn this tick (its assignee profile exists, it is not
+  respawn-guarded, and an unassigned card has a `kanban.default_assignee` this home may
+  claim).
+
+At most **one** card is reclaimed per tick — one freed slot serves one waiting card, and
+the lowest-priority offender goes first, so a single urgent card can never clear several
+runs it does not need. `dispatch --dry-run` never preempts: a preview must not SIGTERM a
+worker.
+
+The candidate must be able to run *this* tick: the freed slot is never reserved for a
+review handoff (a queued review would take it and the card the event names would not
+run), and a card whose profile is at `kanban.max_in_progress_per_profile` does not
+qualify. An unassigned card never qualifies either — preemption cannot prove it will
+spawn.
+
+Note the interaction with the cap above: a `local-only` card that names no
+`max_runtime_seconds` hits its 90-minute `timed_out` first, so preemption in practice
+matters for cards that legitimately run longer — a PR/CI contract (150-minute cap) or an
+explicit per-card `max_runtime_seconds`. A `timed_out` on a default cap counts as a
+failed attempt like any other: a card that cannot finish inside the cap is retried up to
+`kanban.failure_limit` and then auto-blocks for a human — raise its `max_runtime_seconds`,
+give it a PR contract, or split it.
+
+Then the running card is terminated (SIGTERM, then SIGKILL after the usual grace), goes
+back to its source phase (`ready`/`review`) with its workspace, branch and commits
+untouched, and the higher card is spawned by the same tick's lane pass — lanes are ordered
+by priority, so the freed slot goes where it matters. The `preempted` event records
+`preempted_by`, both priorities, the margin and the elapsed time, so `hermes kanban tail
+<id>` answers "why did my card stop?" in one line.
+
+Preemption deliberately does **not** tick `consecutive_failures` and does not touch
+`last_failure_error`: a priority policy is not a worker fault. Unspawnable candidates are
+skipped — preempting for a card that cannot run would destroy work and free nothing.
+
+### Slot hold time in `hermes kanban list`
+
+Every `running` row carries how long its current run has held a slot, and the cap it will
+be held to, measured from the **active** run (a retry does not inherit the first attempt's
+age):
+
+```
+▶ t_ab12cd34  running   default              owner panel  [slot 1h40m/1h30m]
+▶ t_ef56ab78  running   researcher           CI fix       [slot 12m/2h30m]
+```
+
+`no cap` appears only when both the card's own `max_runtime_seconds` and the class default
+are disabled. This is the one-line answer to "is a card stuck holding a slot?", which used
+to need a `ps` investigation.
 
 ### Drag-to-delete and bulk delete (dashboard)
 
@@ -1453,7 +1518,8 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `heartbeat` | `{note?}` | Worker called `hermes kanban heartbeat $TASK` to signal liveness during long operations. |
 | `reclaimed` | `{stale_lock}` | Claim TTL expired without a completion; task goes back to `ready`. An automatic reclaim counts as one non-successful attempt toward the `gave_up` breaker (a claim that never spawned a worker would otherwise loop claim → reclaim → claim forever); an operator `reclaim` resets the counter instead. |
 | `crashed` | `{pid, claimer, exit_kind?, exit_code?, worker_output?}` | Worker PID no longer alive but TTL hadn't expired yet. `worker_output` is the tail of the worker's own log (its final response or the rendered provider error, chrome stripped, ≤ 400 chars) and is also appended to the task's `last_failure_error`, so the board shows *why* instead of only the exit code. |
-| `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |
+| `timed_out` | `{pid, elapsed_seconds, limit_seconds, limit_source, sigkill}` | Wall-clock cap exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. `limit_source` names the rule that fired: `task` (the card's own `max_runtime_seconds`), `default` (90 min) or `default_ci` (150 min, a card whose `completion_contract` publishes a PR and honestly waits on CI — `kanban.default_max_runtime_seconds` / `kanban.ci_max_runtime_seconds`). |
+| `preempted` | `{reason, preempted_by, candidate_priority, running_priority, margin, elapsed_seconds, min_runtime_seconds, pid, terminated}` | A much higher-priority `ready` card needed this run's dispatch slot: `reason` is `higher_priority_ready`, `preempted_by` is the card that took it. The preempted card goes back to `ready`/`review` with its workspace, branch and commits intact, and this is **not** counted as a failure — a priority policy must never walk a card toward the `gave_up` breaker. See [Priority preemption](#priority-preemption). |
 | `stale` | `{elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds, timeout_seconds, pid, terminated}` | Task ran longer than `kanban.dispatch_stale_timeout_seconds` (default 4 h) AND no `kanban_heartbeat` arrived in the last hour. Dispatcher SIGTERM'd the host-local worker (if any), reset the task to `ready` for re-dispatch. Does NOT tick the failure counter (stale is dispatcher-side absence detection, not a worker fault). Workers running long operations should call `kanban_heartbeat` at least once an hour to avoid this. |
 | `reconciled` | `{reason, claim_lock, claim_expires, worker_pid}` | Orphaned-card reconciliation: the card was `running` with broken claim bookkeeping (`claim_lock` or `claim_expires` NULL — crash mid-claim, manual SQL, DB restore) and no live worker, so none of the TTL/crash/stale paths could ever recover it. The dispatcher requeued it to `ready` with an explanatory comment. Gated by `kanban.reconcile_orphans` in config.yaml (default `true`). |
 | `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `infrastructure_cooldown` (the host refused the last spawn — no restart-safe systemd scope — and the cooldown has not elapsed; never counted against the card), `rate_limit_cooldown` (the last run hit a quota wall; same cooldown, never counted), `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |

@@ -69,11 +69,37 @@ def _bulk_apply(ids: Iterable[str], op: Callable[[str], Any],
     return 1 if failed else 0
 
 
-def _fmt_task_line(t: kb.Task) -> str:
+def _fmt_duration(seconds: float) -> str:
+    """Compact age: ``45s``, ``12m``, ``3h42m``, ``2d5h`` (no spaces, one field)."""
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, _secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h{minutes:02d}m" if minutes else f"{hours}h"
+    days, hours = divmod(hours, 24)
+    return f"{days}d{hours}h"
+
+
+def _fmt_task_line(
+    t: kb.Task, *, slot_seconds: Optional[int] = None, limit_seconds: Optional[int] = None,
+) -> str:
+    """One ``list`` row. ``slot_seconds``/``limit_seconds`` are passed for a
+    ``running`` card only: how long the current run has held its dispatch slot and
+    the wall-clock cap it will be held to, so "it has been sitting there for six
+    hours" reads off the board instead of a ``ps`` investigation."""
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    line = f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    if slot_seconds is not None:
+        slot = f"slot {_fmt_duration(slot_seconds)}"
+        slot += f"/{_fmt_duration(limit_seconds)}" if limit_seconds else "/no cap"
+        line += f"  [{slot}]"
+    return line
 
 
 def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:

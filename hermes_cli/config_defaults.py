@@ -1945,6 +1945,21 @@ DEFAULT_CONFIG = {
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
         "dispatch_stale_timeout_seconds": 14400,
+        # Wall-clock cap per run for a card that sets no max_runtime_seconds of its own. Without a
+        # default such a card ran forever on a live heartbeat and pinned its dispatch slot: one
+        # priority-25 card held a slot for 6 h 12 min while a priority-96 card waited. A card whose
+        # completion_contract publishes a PR (anything but local-only) honestly waits on CI and gets
+        # the longer cap below. 0 disables the default for that class (explicit per-card caps still
+        # apply); the dispatcher closes the run with a `timed_out` event naming limit_source.
+        "default_max_runtime_seconds": 5400,
+        "ci_max_runtime_seconds": 9000,
+        # Priority preemption: a ready card at least this far above a RUNNING card takes its slot,
+        # but only after the run has lasted preempt_min_runtime_seconds (both default to 20 points /
+        # 90 min). The preempted card returns to ready with its workspace and commits intact, the run
+        # closes `preempted` with the reason in its event, and it does NOT count as a failure.
+        # Margin 0 turns preemption off; raise min runtime to be more conservative.
+        "preempt_priority_margin": 20,
+        "preempt_min_runtime_seconds": 5400,
         # Each tick, requeue 'running' cards with broken claim bookkeeping (claim_lock or
         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
         # keeps orphans frozen for manual forensics.

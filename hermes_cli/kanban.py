@@ -428,6 +428,9 @@ def _cmd_list(args: argparse.Namespace) -> int:
             include_archived=args.archived, order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id, current_step_key=args.current_step_key,
         )
+        # How long each running card has held its dispatch slot, measured from the
+        # ACTIVE run (a retry must not inherit the first attempt's age).
+        slot_since = kb.running_slot_since(conn) if any(t.status == "running" for t in tasks) else {}
     if _json_out(args, [_task_to_dict(t) for t in tasks]):
         return 0
     # Passive discoverability: only multi-board users see which board this is.
@@ -442,8 +445,19 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if not tasks:
         print("(no matching tasks)")
         return 0
+    now = int(time.time())
+    # Resolved once: the cap class depends only on the card's contract, and the
+    # defaults come from config (``kanban.default_max_runtime_seconds`` etc.).
+    defaults = kb.max_runtime_defaults() if slot_since else (None, None)
     for t in tasks:
-        print(_fmt_task_line(t))
+        since = slot_since.get(t.id) if t.status == "running" else None
+        if since is None:
+            print(_fmt_task_line(t))
+            continue
+        limit, _source = kb.resolve_max_runtime_seconds(
+            t.max_runtime_seconds, t.completion_contract, defaults=defaults,
+        )
+        print(_fmt_task_line(t, slot_seconds=now - since, limit_seconds=limit))
     return 0
 
 

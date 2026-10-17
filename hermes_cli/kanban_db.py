@@ -300,6 +300,93 @@ def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
     return _env_int("HERMES_KANBAN_CLAIM_TTL_SECONDS", DEFAULT_CLAIM_TTL_SECONDS, minimum=1)
 
 
+# Default wall-clock cap per run, for a card that names no
+# ``max_runtime_seconds`` of its own. Without one, a live heartbeat keeps the slot
+# forever: 17.10.2026 a priority-25 card held one of four slots for 6 h 12 min
+# while a priority-96 card waited for a free slot. Two classes, because waiting on
+# CI is honest work and not a wedge: a card whose ``completion_contract``
+# publishes a PR (anything but ``local-only``) legitimately waits on remote
+# checks. ``kanban.default_max_runtime_seconds`` /
+# ``kanban.ci_max_runtime_seconds`` override them; ``0`` disables that class and
+# leaves only explicit per-card caps.
+DEFAULT_MAX_RUNTIME_SECONDS = 90 * 60
+DEFAULT_MAX_RUNTIME_CI_SECONDS = 150 * 60
+
+# ``completion_contract`` spellings that mean "nothing leaves this host": no PR
+# publication, no remote checks to wait for. Anything else is PR/CI work.
+_LOCAL_ONLY_CONTRACTS = frozenset({"", "local-only", "local_only"})
+
+
+def is_ci_waiting_contract(completion_contract: Optional[str]) -> bool:
+    """True when the card's contract makes it wait on remote checks.
+
+    ``completion_contract`` is ``local-only`` (the default), ``OWNER/REPO`` for PR
+    publication, or an exact PR URL. Anything but the local-only spellings — and
+    an empty value — means a run can honestly spend time waiting for CI.
+    """
+    return (completion_contract or "").strip().lower() not in _LOCAL_ONLY_CONTRACTS
+
+
+def max_runtime_defaults() -> tuple[Optional[int], Optional[int]]:
+    """``(default_seconds, ci_seconds)`` from ``kanban.*`` config; None = disabled.
+
+    Read per call: the dispatcher resolves it once per tick, the CLI once per
+    ``list``. ``load_config_readonly`` is cached on the file signature, so this is
+    cheap. An unreadable config (foreign home, broken YAML) keeps the built-in
+    defaults rather than silently removing the cap.
+    """
+    seconds, ci_seconds = DEFAULT_MAX_RUNTIME_SECONDS, DEFAULT_MAX_RUNTIME_CI_SECONDS
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly().get("kanban") or {}
+    except Exception:
+        return seconds, ci_seconds
+
+    def _cap(raw: object, fallback: Optional[int]) -> Optional[int]:
+        if raw is None:
+            return fallback
+        try:
+            value = int(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return fallback
+        # 0 (or negative) disables this class: the operator asked for no cap.
+        return value if value > 0 else None
+
+    return (
+        _cap(cfg.get("default_max_runtime_seconds"), seconds),
+        _cap(cfg.get("ci_max_runtime_seconds"), ci_seconds),
+    )
+
+
+def resolve_max_runtime_seconds(
+    max_runtime_seconds: Optional[int],
+    completion_contract: Optional[str] = None,
+    *,
+    defaults: Optional[tuple[Optional[int], Optional[int]]] = None,
+) -> tuple[Optional[int], Optional[str]]:
+    """``(limit, source)`` — the wall-clock cap one run will be held to.
+
+    ``source`` names the rule that produced the number: ``"task"`` (the card's own
+    ``max_runtime_seconds``), ``"default"`` / ``"default_ci"`` (the class default
+    above), so a ``timed_out`` event says which one fired. ``(None, None)`` = no
+    cap at all — reachable only when the operator disabled every class default.
+    """
+    if max_runtime_seconds is not None:
+        try:
+            explicit = int(max_runtime_seconds)
+        except (TypeError, ValueError):
+            explicit = 0
+        if explicit > 0:
+            return explicit, "task"
+        # An explicit 0/negative is NOT "unbounded": a card may not opt itself out
+        # of the board's slot budget, so it falls through to the class default.
+    default_seconds, ci_seconds = defaults if defaults is not None else max_runtime_defaults()
+    if is_ci_waiting_contract(completion_contract):
+        return (ci_seconds, "default_ci") if ci_seconds else (None, None)
+    return (default_seconds, "default") if default_seconds else (None, None)
+
+
 # ``detect_crashed_workers`` skips ``_pid_alive`` this long after start: the
 # fork -> /proc window can report a fresh worker dead.
 DEFAULT_CRASH_GRACE_SECONDS = 30
@@ -1423,6 +1510,28 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+def running_slot_since(conn: sqlite3.Connection) -> dict[str, int]:
+    """``task_id -> epoch`` when each ``running`` card's CURRENT run started.
+
+    The slot a running card holds is not ``tasks.started_at`` (that is the FIRST
+    start and survives retries): a per-attempt question needs the active
+    ``task_runs`` row, same rule ``enforce_max_runtime`` uses. ``hermes kanban
+    list`` prints the age of this stamp so "it has been sitting there for hours"
+    is one line, not a ``ps`` investigation. Read-only.
+    """
+    rows = conn.execute(
+        "SELECT t.id, COALESCE(r.started_at, t.started_at) AS since "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running'"
+    ).fetchall()
+    since: dict[str, int] = {}
+    for row in rows:
+        epoch = _to_epoch(row["since"])
+        if epoch is not None:
+            since[row["id"]] = int(epoch)
+    return since
+
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
@@ -2162,9 +2271,16 @@ def _claim_and_open_run(
     if cur.rowcount != 1:
         return None
     trow = conn.execute(
-        "SELECT assignee, max_runtime_seconds, current_step_key "
+        "SELECT assignee, max_runtime_seconds, current_step_key, completion_contract "
         "FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
+    # Persist the EFFECTIVE cap on the run row: ``hermes kanban runs`` then shows
+    # the wall-clock rule this attempt ran under, and ``enforce_max_runtime`` has
+    # one number to read instead of re-deriving the class on every tick.
+    run_max_runtime, _ = resolve_max_runtime_seconds(
+        _row_get(trow, "max_runtime_seconds"),
+        _row_get(trow, "completion_contract"),
+    )
     run_cur = conn.execute(
         """
         INSERT INTO task_runs (
@@ -2175,7 +2291,7 @@ def _claim_and_open_run(
         """,
         (
             task_id, trow["assignee"] if trow else None, trow["current_step_key"] if trow else None,
-            lock, expires, trow["max_runtime_seconds"] if trow else None, now,
+            lock, expires, run_max_runtime, now,
         ),
     )
     run_id = run_cur.lastrowid
