@@ -10,6 +10,7 @@ import contextvars
 import inspect
 import json
 import logging
+import math
 import re
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
@@ -402,8 +403,8 @@ class MemoryManager:
         self._has_external: bool = False
         timeout = external_prefetch_timeout
         timeout = _EXTERNAL_PREFETCH_TIMEOUT_S if timeout is None else float(timeout)
-        if timeout <= 0:
-            raise ValueError("external_prefetch_timeout must be positive")
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("external_prefetch_timeout must be positive and finite")
         self._external_prefetch_timeout = timeout
         self._external_prefetch_threads: dict[str, threading.Thread] = {}
         self._external_prefetch_lock = threading.Lock()
