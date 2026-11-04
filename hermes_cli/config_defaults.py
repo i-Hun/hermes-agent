@@ -580,6 +580,11 @@ DEFAULT_CONFIG = {
         "threshold_tokens": None,
         # "progress_notices": False,    # opt-in (#52995): when True, routine compression
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
+        # max_summary_tokens: absolute cap on the summarizer's output (tokens). The built-in cap
+        # is min(5% of the window, 10K) — on a 1M-token model that is 10K output tokens per
+        # compaction, which at DeepSeek's output price costs more than the context it removes.
+        # 0 = built-in behaviour; a positive value is clamped to [_MIN_SUMMARY_TOKENS, 10K].
+        "max_summary_tokens": 0,
         # tail_mode: "lean" = clamped 2.5%-of-window tail (10K floor / 25K cap) plus chunked
         # digests, anchor index, verbatim user messages and session_search pointers in the summary
         # (~3x fewer retained tokens; a few extra summarizer calls at the boundary). "legacy" =

@@ -24,3 +24,17 @@ def test_threshold_tokens_default_and_null_opt_out(agent_cfg, expected):
     cs = _parse_compression_config(_agent(), agent_cfg)
     assert cs.threshold_tokens == expected
     assert cs.threshold == DEFAULT_CONFIG["compression"]["threshold"]
+
+
+@pytest.mark.parametrize(
+    ("agent_cfg", "expected"),
+    [
+        ({}, 0),                                                    # shipped default: built-in cap
+        ({"compression": {"max_summary_tokens": 4000}}, 4000),
+        ({"compression": {"max_summary_tokens": -5}}, 0),           # negatives disable, never raise
+        ({"compression": {"max_summary_tokens": "3000"}}, 3000),    # config strings are coerced
+    ],
+)
+def test_max_summary_tokens_parsed(agent_cfg, expected):
+    cs = _parse_compression_config(_agent(), agent_cfg)
+    assert cs.max_summary_tokens == expected

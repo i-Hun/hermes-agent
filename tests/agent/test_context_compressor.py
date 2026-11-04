@@ -2193,6 +2193,41 @@ class TestTokenBudgetTailProtection:
 
 
 
+class TestConfiguredSummaryCap:
+    """``compression.max_summary_tokens`` only ever lowers the summary budget."""
+
+    def _comp(self, configured: int, window: int = 1_000_000):
+        from unittest.mock import patch
+        with patch("agent.context_compressor.get_model_context_length", return_value=window):
+            return ContextCompressor(
+                "model-a", threshold_percent=0.50, quiet_mode=True,
+                max_summary_tokens=configured,
+            )
+
+    def test_configured_cap_applies(self):
+        assert self._comp(4000).max_summary_tokens == 4000
+
+    def test_builtin_when_zero(self):
+        # min(5% of 1M, 10K) — the built-in ceiling, unchanged by the new knob.
+        assert self._comp(0).max_summary_tokens == 10_000
+
+    def test_cap_never_below_floor(self):
+        from agent.context_compressor import _MIN_SUMMARY_TOKENS
+        assert self._comp(500).max_summary_tokens == _MIN_SUMMARY_TOKENS
+
+    def test_cap_cannot_raise_a_smaller_window(self):
+        # 32K window → built-in 1.6K; a 4K configured cap must not inflate it.
+        comp = self._comp(4000)
+        comp.update_model("model-b", context_length=32_000)
+        assert comp.max_summary_tokens == 1600
+
+    def test_update_model_keeps_the_cap(self):
+        comp = self._comp(4000)
+        assert comp.max_summary_tokens == 4000
+        comp.update_model("model-b", context_length=200_000)
+        assert comp.max_summary_tokens == 4000
+
+
 class TestUpdateModelBudgets:
     """Regression: update_model() must recalculate token budgets."""
 

@@ -2248,7 +2248,13 @@ class ContextCompressor(
     @property
     def max_summary_tokens(self) -> int:
         if self._max_summary_tokens is None:
-            self._max_summary_tokens = min(int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING)
+            builtin = min(int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING)
+            configured = getattr(self, "_config_max_summary_tokens", 0) or 0
+            # A configured cap only ever lowers the built-in budget: the floor is applied to the
+            # requested cap, not to the result, so a small window keeps its own (lower) budget.
+            self._max_summary_tokens = (
+                min(builtin, max(_MIN_SUMMARY_TOKENS, configured)) if configured > 0 else builtin
+            )
         return self._max_summary_tokens
 
     @max_summary_tokens.setter
@@ -2703,7 +2709,9 @@ class ContextCompressor(
         # Reset to None so the property recomputes via the mode-aware path (not the legacy formula).
         self._tail_token_budget = None
         _ = self.tail_token_budget  # eager recompute, same timing as before
-        self.max_summary_tokens = min(int(context_length * 0.05), _SUMMARY_TOKENS_CEILING)
+        # Reset so the property recomputes from the new window — including the configured cap.
+        self._max_summary_tokens = None
+        _ = self.max_summary_tokens
         # Old usage cannot price a new model. Clear it without arming the post-compaction
         # latch: the next response supplies usage or enables the usage-less fallback.
         self.last_prompt_tokens = self.last_completion_tokens = self.last_total_tokens = 0
@@ -2817,7 +2825,7 @@ class ContextCompressor(
         model_thresholds: dict[str, float] | None = None, threshold_tokens_cap: Any = None,
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
-        custom_providers: list | None = None,
+        max_summary_tokens: int = 0, custom_providers: list | None = None,
     ):
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
@@ -2851,6 +2859,10 @@ class ContextCompressor(
         self._last_reclaim_block_warn: tuple[str, int] | None = None
         self.min_tail_user_messages = min_tail_user_messages
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
+        # Absolute cap on the summary's own output (tokens); 0 = built-in min(5% window, 10K).
+        # Output is the priciest lane, and on a 1M-token window the built-in cap alone lets one
+        # compaction emit 10K tokens of summary.
+        self._config_max_summary_tokens = max(0, int(max_summary_tokens or 0))
         self.quiet_mode = quiet_mode
         # Usable input = context_length - max_tokens; only a positive int counts as a reservation.
         self.max_tokens = self._coerce_max_tokens(max_tokens)
