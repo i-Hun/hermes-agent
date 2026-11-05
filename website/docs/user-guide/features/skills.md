@@ -245,6 +245,24 @@ platforms: [macos, linux]     # macOS and Linux
 
 When set, the skill is automatically hidden from the system prompt, `skills_list()`, and slash commands on incompatible platforms. If omitted, the skill loads on all platforms.
 
+### Human-Only Skills (`disable-model-invocation`)
+
+Some skills should never be triggered by the model reading a description — rollback an
+incident, decommission a subsystem, freeze a project. Mark them so the model is never
+offered them:
+
+```yaml
+disable-model-invocation: true
+```
+
+The skill disappears from the system prompt's `<available_skills>` index and from
+`skills_list()`, so nothing in the model's context invites it. It stays fully usable by name:
+`/skill:name`, `hermes -s name`, and `skill_view(name)` all still load it, and it still wins
+name resolution against same-named copies in other skill roots. Only a boolean `true` (or a
+string that reads as one — the quoted `"true"`, or an unquoted `yes`/`on`, which YAML 1.1
+loads as boolean true) disables; anything else — `false`, a quoted `"yes"`, a typo — leaves
+the skill model-invocable, so a typo fails open.
+
 ## Skill output and media delivery
 
 When a skill response (or any agent response) includes a bare absolute path to a media file — for example `/home/user/screenshots/diagram.png` — the gateway auto-detects it, strips it from the visible text, and delivers the file natively to the user's chat (Telegram photo, Discord attachment, etc.) instead of leaving the raw path in the message.

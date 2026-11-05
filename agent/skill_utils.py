@@ -174,6 +174,26 @@ def skill_matches_environment(frontmatter: dict[str, Any]) -> bool:
     return any(_detect_environment(tag) for tag in tags if tag)
 
 
+def skill_model_invocable(frontmatter: dict[str, Any]) -> bool:
+    """True unless the skill declares ``disable-model-invocation: true``.
+
+    The Agent Skills / Claude Code field: the skill is still on disk, still listed to the
+    user and still loadable by name (``skill_view``, ``/skill:name``, ``--skills``), but the
+    model is never OFFERED it — it is left out of the system-prompt ``<available_skills>``
+    index and of ``skills_list()``, so a dangerous skill runs only when a human asks for it
+    by name. Like ``environments:`` this is an offer-time gate, not a compatibility one.
+
+    Only a boolean ``true`` (or the quoted word ``"true"``) disables; anything else — absent,
+    ``false``, some other string — leaves the skill model-invocable, so a typo fails open.
+    (The YAML loader resolves an unquoted ``yes``/``on`` to boolean ``true``, so those disable
+    as well; the string branch covers a value quoted by hand.)
+    """
+    value = frontmatter.get("disable-model-invocation")
+    if isinstance(value, str):
+        return value.strip().lower() != "true"
+    return value is not True
+
+
 def skill_matches_apps(frontmatter: dict[str, Any]) -> bool:
     """True when every app named in ``requires_apps:`` has a registered declaration this host satisfies.
 

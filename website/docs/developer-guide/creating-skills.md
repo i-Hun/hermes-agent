@@ -134,6 +134,25 @@ metadata:
 
 **Use case for `requires_*`:** Create a skill that only makes sense when certain tools are present. For example, a web scraping workflow skill with `requires_toolsets: [web]` won't clutter the prompt when web tools are disabled.
 
+### Model-Invocation Control
+
+`disable-model-invocation: true` keeps a skill off the model's offer list without removing it
+from the system: it is left out of the system prompt's `<available_skills>` index and out of
+`skills_list()`, but it stays loadable by name — `skill_view(name)`, `/skill:name`, and
+`hermes -s name` all still work, and it keeps its name against same-named copies in other
+skill roots.
+
+```yaml
+disable-model-invocation: true     # Optional — the model never gets offered this skill
+```
+
+Use it for skills whose description would tempt the model into doing something a human must
+ask for explicitly: incident rollback, decommissioning a subsystem, freezing a project. The
+flag is offer-time only, like `environments:`; it never blocks an explicit load. Only a
+boolean `true` (or a string that reads as one — the quoted `"true"`, or an unquoted
+`yes`/`on`) disables; anything else — `false`, a quoted `"yes"`, a typo — leaves the skill
+model-invocable, so a typo fails open.
+
 ### Environment Variable Requirements
 
 Skills can declare environment variables they need. When a skill is loaded via `skill_view`, its required vars are automatically registered for passthrough into sandboxed execution environments (terminal, execute_code).
