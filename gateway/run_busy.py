@@ -571,6 +571,15 @@ class GatewayBusySessionMixin:
             return text
         import json
 
+        # A steer is the busy-mode twin of a normal user turn: it must carry the reply pointer too.
+        # Without it a follow-up like "Что это значит" answering a quoted message arrives as a bare
+        # question, and the agent has to ask which message is meant (the normal turn path adds this
+        # in _prepend_inbound_reply_context, which a steer never reaches).
+        from gateway.run_inbound import reply_to_prefix
+        _prefix = reply_to_prefix(event)
+        if _prefix:
+            text = f"{_prefix}\n\n{text}"
+
         source = event.source
         origin = {
             "platform": source.platform.value,
@@ -581,6 +590,11 @@ class GatewayBusySessionMixin:
             "message_id": event.message_id,
             "source_message_id": source.message_id,
         }
+        if getattr(event, "reply_to_message_id", None):
+            # Which earlier message the follow-up answers — the text itself rides the prefix above.
+            origin["reply_to_message_id"] = event.reply_to_message_id
+            origin["reply_to_is_own_message"] = bool(
+                getattr(event, "reply_to_is_own_message", False))
         origin = {key: value for key, value in origin.items() if value not in (None, "")}
         from gateway.run import _load_gateway_config
         from gateway.session import _hash_chat_id, _hash_id, _hash_sender_id, _should_redact_pii
@@ -1241,6 +1255,12 @@ class GatewayBusySessionMixin:
                 text=steer_text, message_type=MessageType.TEXT, source=event.source,
                 message_id=event.message_id, channel_prompt=event.channel_prompt,
                 channel_context=event.channel_context,
+                # The fallback is a normal turn on the same message: keep the reply pointer, or the
+                # quoted message is lost on exactly the path a busy session takes most often.
+                reply_to_message_id=event.reply_to_message_id, reply_to_text=event.reply_to_text,
+                reply_to_author_id=getattr(event, "reply_to_author_id", None),
+                reply_to_author_name=getattr(event, "reply_to_author_name", None),
+                reply_to_is_own_message=getattr(event, "reply_to_is_own_message", False),
             ), adapter, reply):
                 return None  # its commit sends the reply
             return reply

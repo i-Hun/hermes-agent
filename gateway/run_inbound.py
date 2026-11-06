@@ -53,6 +53,32 @@ _RELAY_MEDIA_PREFIX = "relay_media_"
 _UNKNOWN_ATTACHMENT_NAME = "(original filename unknown)"
 
 
+def reply_to_prefix(event: Any) -> str:
+    """The ``[Replying to ...]`` pointer for a reply event, or "" when it is not one.
+
+    Emitted whenever the user explicitly replied to a prior message, even when the quoted text is
+    already in history: it is disambiguation (*which* prior message), not deduplication. Adapters
+    resolve the original message (or the user's native partial quote) at full length — a preview
+    here would silently lose later list items and code. Shared with the busy/steer path, which
+    otherwise injects a reply as a bare question.
+    """
+    reply_id = getattr(event, "reply_to_message_id", None)
+    if not reply_id:
+        return ""
+    reply_text = getattr(event, "reply_to_text", None)
+    own = bool(getattr(event, "reply_to_is_own_message", False))
+    if reply_text:
+        _who = " your previous message" if own else ""
+        return f'[Replying to{_who}: "{reply_text}"]'
+    # A rich/echo-less quoted message comes back with no text, but the pointer still says WHICH
+    # message the user is answering. Dropping it made the reply look like an unprompted question.
+    _who = "your previous message" if own else "an earlier message"
+    return (
+        f"[Replying to {_who} {reply_id} — its text could not be read; resolve it from your "
+        "earlier messages, or ask which message the user is answering]"
+    )
+
+
 def discord_triggering_note(message_id: Any) -> str:
     """Model-facing routing note for a Discord turn (rides the API-bound user message only)."""
     return (
@@ -1598,14 +1624,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
     @staticmethod
     def _prepend_inbound_reply_context(event: MessageEvent, source: SessionSource, message_text: str) -> str:
         """Prepend the reply-to pointer, then the Discord triggering-message note (outermost)."""
-        if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
-            # Always inject the reply-to pointer even when the quoted text is already in history:
-            # it's disambiguation (*which* prior message), not deduplication.
-            # Adapters resolve the original message (or the user's native partial quote).
-            # A preview here silently loses later list items and code; keep that context intact.
-            reply_text = event.reply_to_text
-            _who = " your previous message" if getattr(event, "reply_to_is_own_message", False) else ""
-            message_text = f'[Replying to{_who}: "{reply_text}"]\n\n{message_text}'
+        _prefix = reply_to_prefix(event)
+        if _prefix:
+            message_text = f"{_prefix}\n\n{message_text}"
 
         # Discord: the triggering message id goes on the per-turn user message, never the cached
         # system prompt — it changes every turn and would bust the agent-cache signature. It is
