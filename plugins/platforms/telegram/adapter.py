@@ -7084,12 +7084,22 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         first, then text/caption, rich echo, then the sent index."""
         if not message.reply_to_message:
             return None, None
-        reply_to_id = str(message.reply_to_message.message_id)
+        replied = message.reply_to_message
+        # In a forum topic Telegram fills ``reply_to_message`` with the topic's root service message
+        # on every plain message. That anchor is not a reply to anyone (same rule as the gating
+        # helper ``telegram_context._quoted_reply``); keeping it would make every topic message look
+        # like a reply to the topic root and hide the cases where the quoted text really was lost.
+        if (
+            getattr(message, "is_topic_message", False)
+            and getattr(replied, "message_id", None) == getattr(message, "message_thread_id", None)
+        ):
+            return None, None
+        reply_to_id = str(replied.message_id)
         quote = getattr(message, "quote", None)
         quote_text = getattr(quote, "text", None) if quote is not None else None
         if quote_text:
             return reply_to_id, quote_text
-        reply_to_text = message.reply_to_message.text or message.reply_to_message.caption or None
+        reply_to_text = replied.text or replied.caption or None
         if not reply_to_text:
             reply_to_text = self._extract_rich_reply_text(message.reply_to_message)
         if not reply_to_text:
@@ -7105,6 +7115,20 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 # native quote is present.
                 reply_to_text = None
         return reply_to_id, reply_to_text
+
+    def _reply_is_own_message(self, message: Message) -> bool:
+        """True when this message answers something this bot sent (its own id is the author).
+
+        Lets the agent read "Что это значит" as a question about ITS OWN last message instead of
+        another participant's, and lets the pointer say "your previous message" rather than a bare
+        quote. False for the topic-root anchor and for a missing author.
+        """
+        replied = getattr(message, "reply_to_message", None)
+        if replied is None:
+            return False
+        bot_id = getattr(self._bot, "id", None)
+        author_id = getattr(getattr(replied, "from_user", None), "id", None)
+        return bot_id is not None and author_id is not None and author_id == bot_id
 
     def _build_message_event(self, message: Message, msg_type: MessageType, update_id: Optional[int] = None) -> MessageEvent:
         """Build a MessageEvent from a Telegram message. ``update_id`` lets ``/restart`` record the
@@ -7139,6 +7163,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             user_name=user_name, thread_id=thread_id_str, chat_topic=chat_topic, message_id=str(message.message_id),
             is_bot=bool(getattr(user, "is_bot", False)) if user else False)
         reply_to_id, reply_to_text = self._reply_context(message)
+        reply_to_is_own = self._reply_is_own_message(message) if reply_to_id else False
         from gateway.platforms.base import resolve_channel_prompt  # per-channel/topic ephemeral prompt
         from plugins.platforms.telegram.telegram_context import group_identity_prompt, group_reply_expected
         _chat_id_str = str(chat.id)
@@ -7147,6 +7172,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             text=expand_link_entities(message), message_type=msg_type, source=source, raw_message=message,
             message_id=str(message.message_id), platform_update_id=update_id,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text, auto_skill=topic_skill,
+            reply_to_is_own_message=reply_to_is_own,
             channel_prompt=group_identity_prompt(self, message, channel_prompt), reply_expected=group_reply_expected(self, message, chat_type),
             edit_revision=self._edit_revision(message, update_id), timestamp=message.date)
 

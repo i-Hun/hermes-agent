@@ -152,6 +152,22 @@ class MessageEvent:
         if self.reply_expected is not True and other.reply_expected is not False:
             self.reply_expected = other.reply_expected
 
+    def absorb_reply_context(self, other: "MessageEvent") -> None:
+        """One turn now carries *other* too: keep this event's own quote, else adopt *other*'s.
+
+        Batching (a burst of user messages in one turn) used to move the reply pointer onto the
+        newest message and drop its quoted text, so a reply that arrived second was answered as a
+        bare question. The turn answers the FIRST message that carries a reply; a later one only
+        fills in a quote when the seed has none.
+        """
+        if self.reply_to_message_id or not other.reply_to_message_id:
+            return
+        self.reply_to_message_id = other.reply_to_message_id
+        self.reply_to_text = other.reply_to_text
+        self.reply_to_author_id = other.reply_to_author_id
+        self.reply_to_author_name = other.reply_to_author_name
+        self.reply_to_is_own_message = other.reply_to_is_own_message
+
     def extend_media(self, other: "MessageEvent") -> None:
         """Append *other*'s attachments (urls, types and original names) to this event's. Names are
         padded with ``""`` on either side so each stays on its own attachment; events without names
