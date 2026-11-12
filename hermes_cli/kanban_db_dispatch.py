@@ -1569,8 +1569,8 @@ def check_respawn_guard(
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (a PR URL first published by a comment after which no handoff event
-    arrived; re-spawning risks a duplicate PR — ``reassign --reason`` and
-    ``unblock --reason`` both record that handoff for the SAME profile too,
+    arrived; re-spawning risks a duplicate PR — any operator ``reassign``,
+    a same-profile one included, and ``unblock --reason`` record that handoff,
     see :func:`_is_handoff_event`). The review lane skips the last two: they
     are the *inputs* to a review handoff. Stale / dead claim locks are NOT a
     guard reason — the reclaim passes own those.
@@ -1640,8 +1640,8 @@ def check_respawn_guard(
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     #    Exception: a handoff AFTER the comment that FIRST published that URL
-    #    (operator ``reassign --reason``, reviewer changes_requested, review
-    #    reopen, operator ``unblock --reason``) names the work that must now
+    #    (operator ``reassign``, reviewer changes_requested, review reopen,
+    #    operator ``unblock --reason``) names the work that must now
     #    continue on THAT PR — a closer, or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
@@ -1694,17 +1694,22 @@ def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
     """Whether the event says "work must now continue on the PR this card holds".
 
     ``changes_requested`` / ``review_reopened`` are verdicts: always a handoff.
-    ``assigned`` is a handoff when it moves the card to a DIFFERENT profile —
-    and also when it carries an explicit operator ``reason`` even though the
-    profile is unchanged: on a single-profile board (implementer and reviewer
-    are the same agent) ``reassign <id> <same-profile> --reason "continue on
-    #817"`` is the only way to say it, and refusing it left the card frozen
-    behind ``active_pr`` for the whole window. ``unblocked`` counts the same
-    way — with an explicit reason only, so an automatic re-queue never
-    re-spawns an implementer against its own open PR.
-    A no-op re-assign WITHOUT a reason, an unassign, or the dispatcher's own
-    ``kanban.default_assignee`` write is still not a handoff. Events without
-    ``from`` (written before it was recorded) are not trusted — fail closed.
+    ``assigned`` is a handoff for ANY operator assignment that names a profile,
+    a same-profile ``reassign`` included — typing the command IS the intent: on
+    a single-profile board (implementer and reviewer are the same agent)
+    ``reassign <id> <same-profile>`` is the only way to say "continue on the PR
+    this card already has", and treating it as a no-op froze the card behind
+    ``active_pr`` for the whole 24 h window while the operator had to bounce it
+    through a decoy profile or fake a ``request-changes`` verdict (which then
+    corrupts the review-round statistics). The duplicate-PR protection is about
+    IMPLICIT re-spawns — a crash, a reclaim, an alarm's unblock, the
+    dispatcher's own ``default_assignee`` fill-in — not about the operator who
+    can see the PR in the thread and just asked for the card to run again.
+    ``unblocked`` keeps requiring an explicit reason, so the automatic re-queues
+    still never re-spawn an implementer against its own open PR.
+    An unassign, the dispatcher's own ``kanban.default_assignee`` write, and
+    events without ``from`` (written before it was recorded) are not handoffs —
+    fail closed.
     """
     data = _kb._json_or(payload, {})
     data = data if isinstance(data, dict) else {}
@@ -1718,9 +1723,7 @@ def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
     to = data.get("assignee")
     if not to:
         return False
-    if explicit:
-        return True
-    return "from" in data and data["from"] != to
+    return "from" in data or explicit
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:

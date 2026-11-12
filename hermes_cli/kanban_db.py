@@ -1456,11 +1456,10 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str], 
                 reason: Optional[str] = None) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim.
 
-    ``reason`` is the operator's stated intent (``reassign --reason``).  It is
-    recorded on the ``assigned`` event because a board whose implementer and
-    reviewer are the SAME profile has no other way to say "continue the PR this
-    card already has": a same-profile reassign would be a no-op for the respawn
-    guard, and the card would sit behind ``active_pr`` for the whole window.
+    ``reason`` (``reassign --reason``) is recorded on the ``assigned`` event for
+    the audit trail: the respawn guard reads the ``assigned`` event itself as the
+    operator's "continue the PR this card already has" — a same-profile reassign
+    included — so the reason is documentation, not the signal.
     """
     profile = _canonical_assignee(profile)
     reason = str(reason or "").strip()[:500] or None
@@ -3572,9 +3571,11 @@ def unblock_task(conn: sqlite3.Connection, task_id: str, *,
     when that is where it left off), closing any leaked run first.
 
     ``reason`` (``kanban unblock --reason``) is recorded on the ``unblocked``
-    event: an operator unparking a card with a stated intent is the same
-    "continue" signal as ``reassign --reason``, and it is what lets the card
-    resume the PR its own worker already opened.
+    event, and it is what lets the card resume the PR its own worker already
+    opened: an operator unparking a card with a stated intent is the same
+    "continue" signal as an operator ``reassign``. Without one the event stays
+    silent, so the alarms and the failure breaker — which unblock cards on their
+    own — still cannot re-spawn an implementer against its own open PR.
     """
     reason = str(reason or "").strip()[:500] or None
     now = int(time.time())

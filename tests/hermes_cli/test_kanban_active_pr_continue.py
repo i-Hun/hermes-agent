@@ -10,12 +10,15 @@ at all to resume its own open PR: the card sat in ``ready`` behind
 
 What these tests pin down:
 
-* ``reassign`` to the SAME profile with an explicit ``--reason`` is the
-  operator saying "continue on this PR" and releases the guard; the same
-  reassign without a reason still does not (the duplicate-PR protection is not
-  weakened for silent no-ops).
+* ``reassign`` to the SAME profile releases the guard, with or without
+  ``--reason``: on a single-profile board the command IS the "continue on this
+  PR" signal, and requiring an extra flag left the operator with no working
+  wording at all.
 * ``unblock --reason`` carries the same meaning; a silent unblock (the cron
   alarms and the failure breaker call it that way) does not.
+* What the guard still protects: implicit re-queues — a silent unblock, an
+  unassign, the dispatcher's own ``default_assignee`` fill-in.
+* The native review lane never takes the guard, reassignment or not.
 * A status comment that merely re-quotes the PR already published (the
   worker's "pushed to #817", the operator's note) does not re-arm the guard —
   previously it moved the watermark forward and froze the card again after
@@ -117,16 +120,78 @@ def test_same_profile_reassign_with_reason_lifts_active_pr_and_spawns(
         assert tid not in dict(res.respawn_guarded)
 
 
-def test_same_profile_reassign_without_reason_stays_guarded(
+def test_same_profile_reassign_without_a_reason_lifts_active_pr_and_spawns(
     kanban_home: Path, spawnable: None,
 ) -> None:
-    """The duplicate-PR protection survives: a silent no-op re-assign is not a
-    handoff, so the implementer is not re-spawned against its own PR."""
+    """The reported freeze with the command the operator actually types.
+
+    PR #817 open, two 400/400 timeouts, blocked, alarm-unblock -> the card sat in
+    ``ready`` behind ``active_pr``; ``reassign <id> <same-profile>`` was recorded
+    as ``{from: dev, to: dev}`` and ignored, so the only ways out were a decoy
+    profile round-trip or a fake ``request-changes`` (which corrupts the
+    review-round statistics). Here the plain reassign must release the guard and
+    the worker must start on the very next dispatcher tick.
+    """
     with kbc.connect() as conn:
         tid = _card_with_open_pr(conn)
         assert kb.unblock_task(conn, tid) is True
-        assert kb.reassign_task(conn, tid, "dev") is True
+        ready = kb.get_task(conn, tid)
+        assert ready is not None and ready.status == "ready"
         assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert dict(res.respawn_guarded).get(tid) == "active_pr"
+        assert tid not in [s[0] for s in res.spawned]
+
+        assert kb.reassign_task(conn, tid, "dev") is True
+        after = kb.get_task(conn, tid)
+        assert after is not None and after.status == "ready"
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert tid in [s[0] for s in res.spawned]
+        assert tid not in dict(res.respawn_guarded)
+
+
+def test_a_silent_unblock_and_an_unassign_still_guard_the_implementer(
+    kanban_home: Path, spawnable: None,
+) -> None:
+    """The operator's assignment is the signal; bookkeeping is not.
+
+    An alarm's unblock (no reason) and an unassign both move the card without
+    asking for it to run, so the implementer must not be re-spawned against the
+    PR it opened."""
+    with kbc.connect() as conn:
+        silent = _card_with_open_pr(conn)
+        assert kb.unblock_task(conn, silent) is True
+        assert kbd.check_respawn_guard(conn, silent) == "active_pr"
+
+        unassigned = _card_with_open_pr(conn)
+        assert kb.unblock_task(conn, unassigned) is True
+        assert kb.reassign_task(conn, unassigned, None) is True
+        assert kbd.check_respawn_guard(conn, unassigned) == "active_pr"
+
+
+def test_the_review_lane_is_untouched_by_the_reassign_rule(
+    kanban_home: Path, spawnable: None,
+) -> None:
+    """A review card quotes the PR it reviews by construction: the guard never
+    applies to its lane, whether or not anyone reassigned it."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="review me", assignee="reviewer")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        kb.add_comment(conn, tid, author="worker", body=PR_817)
+        assert kb.request_review(
+            conn, tid, summary="PR ready", expected_run_id=claimed.current_run_id,
+        )
+        assert kbd.check_respawn_guard(conn, tid, lane="review") is None
+
+        assert kb.reassign_task(conn, tid, "reviewer") is True
+        assert kbd.check_respawn_guard(conn, tid, lane="review") is None
+
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert tid in [s[0] for s in res.spawned]
 
 
 def test_operator_unblock_with_reason_lifts_active_pr(
