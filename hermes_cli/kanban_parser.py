@@ -83,7 +83,10 @@ _TASK_IDS = _arg("task_ids", nargs="+")
 _SLUG = _arg("slug")
 _TENANT = _arg("--tenant", help="Tenant namespace")
 _PRIORITY = _arg("--priority", type=int, default=0, help="Priority tiebreaker")
-_RECLAIM_REASON = _reason("Human-readable reason (recorded on the reclaimed event)")
+_RECLAIM_REASON = _reason(
+    "Human-readable reason (recorded on the reclaimed/assigned event; on `reassign` it is "
+    "also the operator's \"continue\" signal, which lets the respawn guard release the card's "
+    "own open PR instead of freezing it)")
 _NOTIFY_TARGET = (
     _arg("--platform", required=True),
     _arg("--chat-id", required=True),

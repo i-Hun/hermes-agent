@@ -501,8 +501,10 @@ def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(
     #111910: ``active_pr`` exists to stop the implementer from opening a
     duplicate PR; it must not stop the closer/recovery profile an operator
     assigned AFTER the PR comment — that handoff is why the PR must be worked.
-    The un-reassigned implementer stays guarded; a newer PR comment posted
-    after the handoff (the closer's own run) guards again.
+    The un-reassigned implementer stays guarded. A later comment that merely
+    re-quotes the SAME PR is not a new publication and does not re-arm the
+    guard; a genuinely new PR URL does
+    (``test_kanban_active_pr_continue.py``).
     """
     import hermes_cli.config as cfgmod
     import hermes_cli.profiles as profmod
@@ -532,7 +534,10 @@ def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(
             conn, closer_id, author="closer",
             body="Pushed to https://github.com/example/repo/pull/44",
         )
-        assert kbd.check_respawn_guard(conn, closer_id) == "active_pr"
+        # Re-quoting the same PR is a status note, not a second publication:
+        # treating it as the watermark used to re-arm the guard right after the
+        # handoff and freeze the card for the rest of the window.
+        assert kbd.check_respawn_guard(conn, closer_id) is None
 
 
 def test_active_pr_guard_holds_through_same_profile_reassign_and_unassign(
