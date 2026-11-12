@@ -1017,6 +1017,9 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
         return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
 
 
+_UNBLOCK_PARKED_STATUSES = ("blocked", "scheduled")
+
+
 def _cmd_unblock(args: argparse.Namespace) -> int:
     if os.environ.get("HERMES_KANBAN_TASK"):
         return _err("kanban unblock is orchestrator-only; workers must hand off their assigned task")
@@ -1027,9 +1030,36 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
-        return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+        # Idempotent by contract: a one-shot alarm calls this on whatever the card
+        # became in the meantime, and "nothing is parked here" is the outcome the
+        # caller asked for — exiting non-zero would mark the alarm as broken and
+        # page the owner on an empty board.
+        for tid in ids:
+            task = kb.get_task(conn, tid)
+            if task is None:
+                print(f"{tid}: no such task — nothing to unblock")
+                continue
+            if task.status not in _UNBLOCK_PARKED_STATUSES:
+                print(f"{tid} is already {task.status} — nothing to unblock")
+                continue
+            if kb.unblock_task(conn, tid):
+                # The note goes in only after the parking is actually gone: a lost
+                # race must leave a closed card's history untouched. Failing to
+                # record it must not turn a completed unpark into an error exit.
+                if reason:
+                    try:
+                        kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
+                    except Exception as exc:  # the unpark already landed
+                        print(f"{tid}: unblocked, but the reason was not recorded: {exc}",
+                              file=sys.stderr)
+                print(f"Unblocked {tid}{suffix}")
+                continue
+            # Lost a race with a concurrent unblock/complete: the parking is gone,
+            # which is exactly the state this command exists to produce.
+            landed = kb.get_task(conn, tid)
+            print(f"{tid} left {task.status} while unblocking "
+                  f"(now {landed.status if landed else 'gone'}) — nothing to do")
+    return 0
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
