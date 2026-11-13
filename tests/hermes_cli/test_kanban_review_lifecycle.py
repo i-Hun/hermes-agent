@@ -501,8 +501,10 @@ def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(
     #111910: ``active_pr`` exists to stop the implementer from opening a
     duplicate PR; it must not stop the closer/recovery profile an operator
     assigned AFTER the PR comment — that handoff is why the PR must be worked.
-    The un-reassigned implementer stays guarded; a newer PR comment posted
-    after the handoff (the closer's own run) guards again.
+    The un-reassigned implementer stays guarded. A later comment that merely
+    re-quotes the SAME PR is not a new publication and does not re-arm the
+    guard; a genuinely new PR URL does
+    (``test_kanban_active_pr_continue.py``).
     """
     import hermes_cli.config as cfgmod
     import hermes_cli.profiles as profmod
@@ -532,18 +534,24 @@ def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(
             conn, closer_id, author="closer",
             body="Pushed to https://github.com/example/repo/pull/44",
         )
-        assert kbd.check_respawn_guard(conn, closer_id) == "active_pr"
+        # Re-quoting the same PR is a status note, not a second publication:
+        # treating it as the watermark used to re-arm the guard right after the
+        # handoff and freeze the card for the rest of the window.
+        assert kbd.check_respawn_guard(conn, closer_id) is None
 
 
-def test_active_pr_guard_holds_through_same_profile_reassign_and_unassign(
+def test_active_pr_guard_lifts_for_a_same_profile_reassign_but_not_for_unassign(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only a handoff to a DIFFERENT profile lifts ``active_pr``.
+    """An operator assignment names the work; only implicit re-queues stay held.
 
-    A no-op ``assign dev -> dev`` (CLI, dashboard PATCH, ``reassign --reclaim``)
-    and an unassign both record an ``assigned`` event but change no owner; if
-    they counted as handoffs the implementer would be re-spawned against its own
-    PR — the duplicate-work protection #111910 says must survive.
+    ``assign dev -> dev`` and ``reassign --reclaim dev -> dev`` are the operator
+    saying "run this card again on the PR it already has" — on a single-profile
+    board there is no other wording for it, and holding them froze the card
+    behind ``active_pr`` for the whole 24 h window. An unassign (``assign None``)
+    and the dispatcher's own ``kanban.default_assignee`` fill-in change ownership
+    without asking for a run, so the duplicate-work protection #111910 stands for
+    still applies to them.
     """
     import hermes_cli.config as cfgmod
     import hermes_cli.profiles as profmod
@@ -552,25 +560,30 @@ def test_active_pr_guard_holds_through_same_profile_reassign_and_unassign(
     monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
     pr_comment = "Opened https://github.com/example/repo/pull/44 for review."
     with kbc.connect() as conn:
+        held = kb.create_task(conn, title="unassigned keeps the guard", assignee="dev")
+        kb.add_comment(conn, held, author="dev", body=pr_comment)
+        _backdate_comments(conn, held)
+        assert kb.assign_task(conn, held, None) is True
+        assert kbd.check_respawn_guard(conn, held) == "active_pr"
+        # The dispatcher's own default_assignee write is not an operator handoff.
+        res = kbd.dispatch_once(conn, dry_run=False, default_assignee="dev")
+        assert held in res.auto_assigned_default
+        assert dict(res.respawn_guarded).get(held) == "active_pr"
+        assert held not in [s[0] for s in res.spawned]
+
         tid = kb.create_task(conn, title="same assign", assignee="dev")
         kb.add_comment(conn, tid, author="dev", body=pr_comment)
         _backdate_comments(conn, tid)
-        assert kb.assign_task(conn, tid, "dev") is True
         assert kbd.check_respawn_guard(conn, tid) == "active_pr"
         assert kb.reassign_task(conn, tid, "dev", reclaim_first=True) is True
-        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
-
-        assert kb.assign_task(conn, tid, None) is True
-        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
-        # The dispatcher's own default_assignee write is not an operator handoff.
-        res = kbd.dispatch_once(conn, dry_run=False, default_assignee="dev")
-        assert tid in res.auto_assigned_default
-        assert dict(res.respawn_guarded).get(tid) == "active_pr"
-        assert tid not in [s[0] for s in res.spawned]
-
-        # A real handoff after all of that still lifts the guard.
-        assert kb.assign_task(conn, tid, "closer") is True
         assert kbd.check_respawn_guard(conn, tid) is None
+
+        # A handoff to a DIFFERENT profile keeps lifting it, as before.
+        closer = kb.create_task(conn, title="closer", assignee="dev")
+        kb.add_comment(conn, closer, author="dev", body=pr_comment)
+        _backdate_comments(conn, closer)
+        assert kb.assign_task(conn, closer, "closer") is True
+        assert kbd.check_respawn_guard(conn, closer) is None
 
 
 def test_active_pr_guard_lifts_for_implementer_after_changes_requested(

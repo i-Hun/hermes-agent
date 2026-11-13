@@ -1452,9 +1452,17 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
-    """Assign/reassign; raises RuntimeError while the task is running under a claim."""
+def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str], *,
+                reason: Optional[str] = None) -> bool:
+    """Assign/reassign; raises RuntimeError while the task is running under a claim.
+
+    ``reason`` (``reassign --reason``) is recorded on the ``assigned`` event for
+    the audit trail: the respawn guard reads the ``assigned`` event itself as the
+    operator's "continue the PR this card already has" — a same-profile reassign
+    included — so the reason is documentation, not the signal.
+    """
     profile = _canonical_assignee(profile)
+    reason = str(reason or "").strip()[:500] or None
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -1475,10 +1483,13 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
         # ``from`` lets the respawn guard tell a real handoff (dev→closer) from
-        # a no-op re-assign or an unassign, which must not lift ``active_pr``.
-        _append_event(
-            conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"]},
-        )
+        # a no-op re-assign or an unassign, which must not lift ``active_pr``;
+        # an explicit ``reason`` is the operator's "continue on this PR" and
+        # lifts it even when the profile does not change.
+        event: dict[str, Any] = {"assignee": profile, "from": row["assignee"]}
+        if reason:
+            event["reason"] = reason
+        _append_event(conn, task_id, "assigned", event)
     # Observer fires AFTER commit so subscribers see durable state.
     notify_task_updated(conn, task_id, ("assignee",))
     return True
@@ -2519,7 +2530,7 @@ def reassign_task(
         reclaim_task(conn, task_id, reason=reason or "reassign")
     # assign_task handles its own txn + the still-running guard.
     try:
-        return assign_task(conn, task_id, profile)
+        return assign_task(conn, task_id, profile, reason=reason)
     except RuntimeError:
         # Task is still running and reclaim_first was False; caller
         # needs to decide whether to retry with reclaim.
@@ -3554,9 +3565,19 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(conn: sqlite3.Connection, task_id: str, *,
+                 reason: Optional[str] = None) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    when that is where it left off), closing any leaked run first.
+
+    ``reason`` (``kanban unblock --reason``) is recorded on the ``unblocked``
+    event, and it is what lets the card resume the PR its own worker already
+    opened: an operator unparking a card with a stated intent is the same
+    "continue" signal as an operator ``reassign``. Without one the event stays
+    silent, so the alarms and the failure breaker — which unblock cards on their
+    own — still cannot re-spawn an implementer against its own open PR.
+    """
+    reason = str(reason or "").strip()[:500] or None
     now = int(time.time())
     with write_txn(conn):
         resume_status = (
@@ -3587,14 +3608,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
-        )
+        payload: Optional[dict[str, Any]] = None
+        if new_status != "ready" or resume_status != "ready":
+            payload = {"status": new_status, "resume_status": resume_status}
+        if reason:
+            payload = {**(payload or {}), "reason": reason}
+        _append_event(conn, task_id, "unblocked", payload)
         return True
 
 

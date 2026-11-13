@@ -83,7 +83,10 @@ _TASK_IDS = _arg("task_ids", nargs="+")
 _SLUG = _arg("slug")
 _TENANT = _arg("--tenant", help="Tenant namespace")
 _PRIORITY = _arg("--priority", type=int, default=0, help="Priority tiebreaker")
-_RECLAIM_REASON = _reason("Human-readable reason (recorded on the reclaimed event)")
+_RECLAIM_REASON = _reason(
+    "Human-readable reason (recorded on the reclaimed/assigned event; the `reassign` itself — "
+    "same profile or not — is the operator's \"continue\" signal that lets the respawn guard "
+    "release the card's own open PR, so the reason is optional documentation)")
 _NOTIFY_TARGET = (
     _arg("--platform", required=True),
     _arg("--chat-id", required=True),
@@ -264,7 +267,8 @@ _SPECS = [
         _arg("--reclaim", action="store_true",
              help="Release any active claim before reassigning (required if task is running)"),
         _RECLAIM_REASON,
-    ], help="Reassign a task to a different profile, optionally reclaiming first"),
+    ], help="Reassign a task, optionally reclaiming first (reassigning to its CURRENT "
+             "profile is a deliberate re-run: it releases the card's active_pr respawn guard)"),
     _cmd("diagnostics", [
         _arg("--severity", choices=["warning", "error", "critical"],
              help="Only show diagnostics at or above this severity"),
