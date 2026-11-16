@@ -513,13 +513,34 @@ class GatewayModelCommandsMixin:
             return await asyncio.to_thread(_detect)
         return ""
 
-    async def _model_listing_reply(
-        self, event: MessageEvent, ctx: _ModelSwitchContext, profile_home
-    ) -> Optional[str]:
-        """``/model`` with no args: interactive picker where supported, else the text list."""
+    async def _model_text_listing(self, listing_kwargs: dict) -> str:
+        """``/model`` with no args on a surface without pickers, or when no provider can be listed."""
         from hermes_cli.model_switch import list_authenticated_providers
         from hermes_cli.providers import get_label
 
+        lines = [t("gateway.model.current_label",
+                   model=listing_kwargs["current_model"] or t("gateway.shared.unknown_value"),
+                   provider=get_label(listing_kwargs["current_provider"])), ""]
+        try:  # off-loop: listing still reads config/disk cache synchronously (#41289)
+            providers = await asyncio.to_thread(list_authenticated_providers, max_models=_TEXT_LISTING_MODELS, **listing_kwargs)
+            lines.extend(_model_provider_listing_lines(providers))
+        except Exception:  # best-effort preview: the usage lines below still answer the command
+            logger.warning("model listing preview failed", exc_info=True)
+        lines.append(t("gateway.model.usage_switch_model"))
+        lines.append(t("gateway.model.usage_switch_provider"))
+        lines.append(t("gateway.model.usage_persist"))
+        lines.append(t("gateway.model.usage_reset"))
+        return "\n".join(lines)
+
+    async def _model_listing_reply(
+        self, event: MessageEvent, ctx: _ModelSwitchContext, profile_home, *, ask_scope: bool = False
+    ) -> Optional[str]:
+        """``/model`` with no args: interactive picker where supported, else the text list.
+
+        *ask_scope* puts a scope screen in front of the picker: the tap persists however the command's
+        flags resolved (``model.persist_switch_by_default`` included), and a bare ``/model`` otherwise
+        leaves no way to say "this session only" without knowing the ``--session`` flag.
+        """
         # Unset, empty or ``auto`` ``model.provider``: ``ctx.current_provider`` holds a placeholder
         # (``openrouter``, ``auto``, ``""``) — display the provider the resolver routes through instead.
         display_provider = ctx.current_provider
@@ -535,13 +556,17 @@ class GatewayModelCommandsMixin:
             non_blocking_catalogs=True, probe_custom_providers=False, probe_current_custom_provider=True,
         )
         adapter = self._delivery_adapter_for(ctx.source)
-        if adapter is not None and getattr(type(adapter), "send_model_picker", None) is not None:
+        picker_capable = adapter is not None and getattr(type(adapter), "send_model_picker", None) is not None
+
+        def _picker_callback(switch_ctx: _ModelSwitchContext):
+            """Picker tap → switch on *switch_ctx*, so the scope chosen one screen earlier decides
+            whether the write-through reaches config.yaml."""
             async def _picker_switch(model_id: str, provider_slug: str) -> str:
                 # The picker callback binds the raw event source (pre-normalization).
-                result, error = await self._perform_model_switch(ctx, model_id, provider_slug, event.source)
+                result, error = await self._perform_model_switch(switch_ctx, model_id, provider_slug, event.source)
                 if error is not None:
                     return error
-                return await self._commit_model_switch(result, ctx, source=event.source, picker=True)
+                return await self._commit_model_switch(result, switch_ctx, source=event.source, picker=True)
 
             async def _on_model_selected(_chat_id: str, model_id: str, provider_slug: str) -> str:
                 if profile_home is None:
@@ -549,22 +574,36 @@ class GatewayModelCommandsMixin:
                 from gateway.run import _profile_runtime_scope
                 with _profile_runtime_scope(profile_home):
                     return await _picker_switch(model_id, provider_slug)
+            return _on_model_selected
 
-            if await self._send_model_picker(event, ctx.source, adapter, ctx.session_key, listing_kwargs, _on_model_selected):
-                return None  # Picker sent — adapter handles the response
+        if picker_capable and ask_scope and getattr(type(adapter), "send_choice_picker", None) is not None:
+            async def _on_scope_selected(_chat_id: str, value: str) -> str:
+                # Fail-closed on an unknown value: only an explicit "global" writes config.yaml.
+                scoped_ctx = dataclasses.replace(ctx, persist_global=value == "global")
+                if not await self._send_model_picker(
+                    event, ctx.source, adapter, ctx.session_key, listing_kwargs, _picker_callback(scoped_ctx)
+                ):
+                    return await self._model_text_listing(listing_kwargs)  # no catalog to pick from
+                label_key = "gateway.model.scope_session" if value == "session" else "gateway.model.scope_global"
+                return t("gateway.model.scope_chosen", scope=t(label_key))
 
-        lines = [t("gateway.model.current_label", model=ctx.current_model or t("gateway.shared.unknown_value"),
-                   provider=get_label(display_provider)), ""]
-        try:  # off-loop: listing still reads config/disk cache synchronously (#41289)
-            providers = await asyncio.to_thread(list_authenticated_providers, max_models=_TEXT_LISTING_MODELS, **listing_kwargs)
-            lines.extend(_model_provider_listing_lines(providers))
-        except Exception:
-            pass
-        lines.append(t("gateway.model.usage_switch_model"))
-        lines.append(t("gateway.model.usage_switch_provider"))
-        lines.append(t("gateway.model.usage_persist"))
-        lines.append(t("gateway.model.usage_reset"))
-        return "\n".join(lines)
+            if await self._try_send_choice_picker(
+                event, ctx.session_key, title=t("gateway.model.scope_title"),
+                choices=[
+                    {"value": "session", "label": t("gateway.model.scope_session"),
+                     "is_current": not ctx.persist_global},
+                    {"value": "global", "label": t("gateway.model.scope_global"),
+                     "is_current": ctx.persist_global},
+                ],
+                on_choice_selected=_on_scope_selected,
+            ):
+                return None  # Scope picker sent — the tap continues into the model picker
+
+        if picker_capable and await self._send_model_picker(
+            event, ctx.source, adapter, ctx.session_key, listing_kwargs, _picker_callback(ctx)
+        ):
+            return None  # Picker sent — adapter handles the response
+        return await self._model_text_listing(listing_kwargs)
 
     async def _model_selection_guard_reply(
         self, event: MessageEvent, ctx: _ModelSwitchContext, result
@@ -662,7 +701,12 @@ class GatewayModelCommandsMixin:
             ctx.apply_override({"model": _ch_model, **(_ch_route or ({"provider": _ch_forced} if _ch_forced else {}))})
         ctx.apply_override(self._session_model_overrides.get(session_key, {}))
         if not request.target and not request.explicit_provider:
-            return await self._model_listing_reply(event, ctx, profile_home)
+            return await self._model_listing_reply(
+                event, ctx, profile_home,
+                # An explicit --global/--session already answered the scope question. A bare
+                # --once never reaches here: the parser requires a model or provider for it.
+                ask_scope=not (request.is_global or request.is_session),
+            )
         result, error = await self._perform_model_switch(ctx, request.target, request.explicit_provider, source)
         if error is not None:
             return error
